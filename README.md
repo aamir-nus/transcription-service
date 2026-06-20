@@ -1,6 +1,8 @@
-# transcription-service
+![1781950321671](image/README/1781950321671.png)
 
-Single-file speech-to-text service built on [WhisperX](https://github.com/m-bain/whisperX). No Docker — a sequential pipeline that transcribes, aligns, diarizes and produces a clean speaker script, exposed through a CLI and an async HTTP API.
+# scribe-lite : a speech-to-text transcription-service
+
+Single-file speech-to-text service built on [WhisperX](https://github.com/m-bain/whisperX) for long-form audio. No Docker — a sequential pipeline that transcribes, aligns, diarizes and produces a clean speaker script, exposed through a CLI and an async HTTP API.
 
 Everything lives in [`transcribe.py`](transcribe.py), plus [`output_format_adapters.py`](output_format_adapters.py) for rendering the script to `.md` / `.vtt`. All settings are read from a `.env` file via `load_dotenv()`.
 
@@ -12,6 +14,7 @@ output_format_adapters.py      # md / vtt renderers + save()
 .env                            # all configuration
 Data/                           # default input audio location
 Output/                         # default transcription output location (created on demand)
+.transcribe_cache/             # resume checkpoints (gitignored, created on demand)
 ```
 
 ## Pipeline
@@ -26,14 +29,67 @@ The engine (`run_pipeline`) runs strictly one stage at a time, freeing each mode
 6. **`[6/7]` Assign speakers** — map speakers onto segments.
 7. **`[7/7]` Build script** — emit a list of `{ "time": { "start", "end" }, "speaker", "text" }`.
 
+Every stage logs how long it took, and the final line prints the total plus a
+per-stage breakdown:
+
+```
+[done] pipeline complete: 412 segments in 98.4s (convert 1.2, asr 42.3, align 8.1, diarize 40.5, assign 0.4, build 0.1)
+```
+
+## Resume & checkpointing
+
+A run can fail at any of the seven steps (OOM, a gated-model 401, …). To avoid
+re-doing the expensive ASR pass after a late failure, each stage's output is
+written to a per-job folder under `.transcribe_cache/`, keyed by a digest of the
+**input file's content** + the params that affect the output. Re-running the same
+file resumes from the last stage that completed.
+
+Per-job folder (`.transcribe_cache/<digest>/`):
+
+| file              | stage | what it stores                                       |
+| ----------------- | ----- | ---------------------------------------------------- |
+| `converted.mp3` | 1     | the normalized 16 kHz mono audio                     |
+| `asr.json`      | 2     | raw ASR result (the expensive one)                   |
+| `aligned.json`  | 4     | word-aligned result                                  |
+| `diarize.json`  | 5     | speaker turns as `[{start, end, speaker}, …]`     |
+| `final.json`    | 6     | result after speaker assignment                      |
+| `script.json`   | 7     | the final clean script (a hit here = instant return) |
+| `meta.json`     | —    | content hash, params, status, timings                |
+
+So if diarization fails on a 3-hour file, you fix `HF_TOKEN`, re-run, and only
+steps 5–7 re-run — the multi-gigabyte transcription is reused.
+
+Cache-hit stages are logged (`[5/7] cache hit: diarization`). The cache key
+excludes `batch_size` (it doesn't change the output), so tweaking it for memory
+won't bust the cache. It **does** include model name, device, compute type,
+language, speaker bounds, diarization model, and the WhisperX version.
+
+- CLI: `--no-resume` ignores the cache and runs the full pipeline.
+- HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
+- Disable globally with `RESUME=false` in `.env`.
+- Wipe the cache any time: `rm -rf .transcribe_cache`.
+
 ## Prerequisites
 
 - Python ≥ 3.12
 - [`uv`](https://docs.astral.sh/uv/) (used to manage the venv)
 - **ffmpeg** on your PATH — `brew install ffmpeg`
-- An **Hugging Face token** with access to the gated diarization model
-  ([`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1)).
-  Accept the model conditions on the page, then create an access token.
+- **Hugging Face access to the diarization model.** The pipeline uses
+  [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1),
+  which is **gated**. Do this **first**, before running anything:
+
+  1. Open the [model page](https://huggingface.co/pyannote/speaker-diarization-community-1)
+     and accept the **user conditions** (button near the top).
+  2. Create a read access token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
+  3. Put it in `.env` as `HF_TOKEN=hf_xxx`.
+
+  > If diarization later 401/403s on a sub-model, open that model's page and
+  > accept its conditions too — but the main repo above is the required one.
+  >
+
+  Skip step 1/2 and diarization fails with a `401`/`403`. Thanks to the
+  checkpointing below, you can fix the token and **resume from the last
+  completed stage** — no re-transcription needed.
 
 ## Setup
 
@@ -55,6 +111,9 @@ PORT=8000
 DATA_DIR=Data                 # default input audio directory
 OUTPUT_DIR=Output             # default output directory
 DEFAULT_OUTPUT_FORMAT=md      # md | vtt  (used when --format and the -o suffix are absent)
+RESUME=true                   # checkpoint each stage; re-runs resume from last success
+CHECKPOINT_DIR=.transcribe_cache   # where checkpoints live (gitignored)
+DIARIZE_MODEL=                # override diarization model (default: pyannote/speaker-diarization-community-1)
 ```
 
 > **Device / compute type note:** `int8` quantization is a CUDA-only path in
@@ -80,6 +139,9 @@ uv run python transcribe.py transcribe /abs/path/audio.mp3 \
 
 # dump the raw JSON script to stdout instead of a formatted file
 uv run python transcribe.py transcribe meeting.m4a --json
+
+# ignore saved checkpoints and run the full pipeline from scratch
+uv run python transcribe.py transcribe meeting.m4a --no-resume
 ```
 
 ### Output formats (`output_format_adapters.py`)
