@@ -11,5 +11,10 @@ wheels/
 .claude
 .env
 
+# Transcription inputs/outputs (kept local)
 Data
+Output
 Outputs
+
+# Resume checkpoints (transcribed artifacts, kept local)
+.transcribe_cache
