@@ -11,12 +11,17 @@ through three front-ends:
 
 Run ``python transcribe.py serve`` to start the HTTP API.
 
+Each stage of the pipeline is checkpointed (keyed by the input file's content
+hash + params), so a failed run resumes from the last successful stage instead
+of starting over. Per-stage and total wall-clock timings are logged.
+
 All configuration is read from environment variables (see .env).
 """
 
 import argparse
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +30,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +39,8 @@ from dotenv import load_dotenv
 # Always refresh from .env so config changes are picked up without a reinstall.
 load_dotenv(override=True)
 
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import torch  # noqa: E402  (import after load_dotenv so CUDA/MPS env tweaks apply)
 import uvicorn  # noqa: E402
 import whisperx  # noqa: E402
@@ -65,6 +73,13 @@ DATA_DIR: Path = Path(os.getenv("DATA_DIR", "Data"))
 OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "Output"))
 DEFAULT_OUTPUT_FORMAT: str = os.getenv("DEFAULT_OUTPUT_FORMAT", "md")
 
+# Resume / checkpointing. Each expensive stage is cached under CHECKPOINT_DIR in
+# a folder keyed by the input file's content hash + params; re-running the same
+# file resumes from the last completed stage instead of starting over.
+RESUME: bool = os.getenv("RESUME", "true").lower() in {"1", "true", "yes", "on"}
+CHECKPOINT_DIR: Path = Path(os.getenv("CHECKPOINT_DIR", ".transcribe_cache"))
+DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -95,7 +110,9 @@ def release_model(obj) -> None:
 # --------------------------------------------------------------------------- #
 # Input normalization
 # --------------------------------------------------------------------------- #
-def convert_to_mp3(input_path: str, out_dir: Optional[str] = None) -> str:
+def convert_to_mp3(
+    input_path: str, out_dir: Optional[str] = None, out_name: Optional[str] = None
+) -> str:
     """Convert any audio container to a normalized 16 kHz mono MP3 via ffmpeg.
 
     Runs once at the start of the pipeline so every downstream stage works from
@@ -113,7 +130,8 @@ def convert_to_mp3(input_path: str, out_dir: Optional[str] = None) -> str:
         Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="tscript-convert-"))
     )
     work_dir.mkdir(parents=True, exist_ok=True)
-    out_path = work_dir / f"{src.stem}.mp3"
+    out_name = out_name or f"{src.stem}.mp3"
+    out_path = work_dir / out_name
 
     cmd = [
         ffmpeg,
@@ -142,6 +160,161 @@ def convert_to_mp3(input_path: str, out_dir: Optional[str] = None) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Resume / checkpointing
+# --------------------------------------------------------------------------- #
+# The pipeline has seven stages and any of them can fail (OOM, a gated-model
+# hiccup, ...). To get resume safety we persist each stage's output to disk in
+# a per-job folder keyed by a digest of the input file's *content* + the params
+# that affect the output. Re-running the same file picks up at the last stage
+# that completed, so e.g. a diarization failure never forces a re-transcription.
+#
+# Job folder layout (<CHECKPOINT_DIR>/<digest>/):
+#   meta.json         params, content hash, status, timings
+#   converted.mp3     [1] normalized audio
+#   asr.json          [2] raw ASR result (the expensive one)
+#   aligned.json      [4] word-aligned result
+#   diarize.json      [5] speaker turns as [{"start","end","speaker"}, ...]
+#   final.json        [6] result after speaker assignment
+#   script.json       [7] the final clean script
+_CKPT_AUDIO = "converted.mp3"
+_CKPT_ASR = "asr.json"
+_CKPT_ALIGNED = "aligned.json"
+_CKPT_DIARIZE = "diarize.json"
+_CKPT_FINAL = "final.json"
+_CKPT_SCRIPT = "script.json"
+
+
+def _sha256_file(path: str | Path, chunk: int = 1 << 20) -> str:
+    """Streaming SHA-256 of a file's bytes."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _cache_params(
+    language: Optional[str],
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> dict:
+    """Params that change a stage's output -> part of the cache key.
+
+    ``batch_size`` is intentionally excluded: it only affects speed, not the
+    transcription output, so changing it should NOT invalidate the cache.
+    """
+    return {
+        "model": MODEL_NAME,
+        "device": DEVICE,
+        "compute_type": COMPUTE_TYPE,
+        "diarize_model": DIARIZE_MODEL or "default",
+        "language": language,  # None == auto-detect
+        "min_speakers": min_speakers,
+        "max_speakers": max_speakers,
+        "whisperx": getattr(whisperx, "__version__", "unknown"),
+    }
+
+
+def _jsonable(obj):
+    """Coerce numpy/pandas scalars and arrays into JSON-serializable Python.
+
+    WhisperX/faster-whisper sprinkle ``numpy.float32`` etc. through their result
+    dicts; ``json.dumps`` can't serialize those directly.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [_jsonable(v) for v in obj.tolist()]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+@contextmanager
+def _timed(store: dict, key: str):
+    """Record wall-clock seconds spent inside the block into ``store[key]``."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        store[key] = round(time.perf_counter() - start, 3)
+
+
+class Checkpoint:
+    """Per-job artifact store, keyed by input content hash + params digest."""
+
+    def __init__(self, root: Path, digest: str, meta: dict):
+        self.root = root
+        self.digest = digest
+        self.dir = root / digest
+        self.meta = meta
+
+    @classmethod
+    def open(cls, audio_path: str | Path, params: dict) -> "Checkpoint":
+        root = CHECKPOINT_DIR
+        root.mkdir(parents=True, exist_ok=True)
+        content_hash = _sha256_file(audio_path)
+        digest = hashlib.sha256(
+            json.dumps(
+                {"content": content_hash, "params": params}, sort_keys=True
+            ).encode()
+        ).hexdigest()[:24]
+        job_dir = root / digest
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        meta_path = job_dir / "meta.json"
+        meta: dict = {}
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+            except Exception:  # corrupt meta -> start fresh
+                meta = {}
+        meta.update(
+            {
+                "digest": digest,
+                "content_sha256": content_hash,
+                "input_name": Path(audio_path).name,
+                "params": params,
+            }
+        )
+        ckpt = cls(root, digest, meta)
+        ckpt._write_meta()
+        return ckpt
+
+    def _write_meta(self) -> None:
+        now = time.time()
+        self.meta.setdefault("created_at", now)
+        self.meta["updated_at"] = now
+        (self.dir / "meta.json").write_text(json.dumps(self.meta, indent=2))
+
+    def path(self, name: str) -> Path:
+        return self.dir / name
+
+    def has(self, name: str) -> bool:
+        return self.path(name).exists()
+
+    def save_json(self, name: str, obj) -> None:
+        self.path(name).write_text(
+            json.dumps(_jsonable(obj), ensure_ascii=False), encoding="utf-8"
+        )
+
+    def load_json(self, name: str):
+        return json.loads(self.path(name).read_text(encoding="utf-8"))
+
+    def record(self, **fields) -> None:
+        self.meta.update(fields)
+        self._write_meta()
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline engine core (sequential, blocking)
 # --------------------------------------------------------------------------- #
 def run_pipeline(
@@ -151,6 +324,7 @@ def run_pipeline(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     batch_size: int = BATCH_SIZE,
+    resume: bool = RESUME,
 ) -> list[dict]:
     """Transcribe ``audio_path`` end-to-end and return a clean speaker script.
 
@@ -164,84 +338,194 @@ def run_pipeline(
       6. assign speakers to segments
       7. shape into ``[{"time": {"start", "end"}, "speaker", "text"}, ...]``
 
-    The list of script dicts is returned.
+    When ``resume`` is true (default; toggle with ``RESUME``) every stage's
+    output is checkpointed under ``CHECKPOINT_DIR`` keyed by the input's content
+    hash + params, so a re-run on the same file resumes from the last completed
+    stage instead of starting over. Per-stage and total timings are logged.
     """
-    convert_dir = Path(tempfile.mkdtemp(prefix="tscript-convert-"))
+    timings: dict[str, float] = {}
+    total_t0 = time.perf_counter()
+
+    ckpt: Optional[Checkpoint] = None
+    if resume:
+        ckpt = Checkpoint.open(
+            audio_path, _cache_params(language, min_speakers, max_speakers)
+        )
+
+    # Fast path: a finished script for this exact input+params already exists.
+    if ckpt and ckpt.has(_CKPT_SCRIPT):
+        log.info(
+            "[resume] cache hit for %s -- returning completed script",
+            Path(audio_path).name,
+        )
+        return ckpt.load_json(_CKPT_SCRIPT)
+
+    # The normalized mp3 lives in the checkpoint dir (reusable) or a temp dir.
+    convert_dir: Optional[Path] = None
+    convert_out = (
+        ckpt.dir if ckpt else Path(tempfile.mkdtemp(prefix="tscript-convert-"))
+    )
+    if not ckpt:
+        convert_dir = convert_out
+
+    audio = None  # numpy array; loaded by ASR, or on a cache hit before align
+    result: Optional[dict] = None
+
     try:
         # 1. normalize input to mp3 --------------------------------------- #
         log.info("[1/7] converting input to mp3")
-        audio_path = convert_to_mp3(audio_path, out_dir=str(convert_dir))
+        with _timed(timings, "convert"):
+            if ckpt and ckpt.has(_CKPT_AUDIO):
+                log.info("[1/7] cache hit: normalized audio")
+                converted_mp3 = ckpt.path(_CKPT_AUDIO)
+            else:
+                converted_mp3 = Path(
+                    convert_to_mp3(
+                        audio_path,
+                        out_dir=str(convert_out),
+                        out_name=_CKPT_AUDIO if ckpt else None,
+                    )
+                )
+        audio_path = str(converted_mp3)
 
         # 2. ASR ----------------------------------------------------------- #
-        log.info(
-            "[2/7] loading ASR model %s on %s (compute_type=%s)",
-            MODEL_NAME,
-            DEVICE,
-            COMPUTE_TYPE,
-        )
-        model = whisperx.load_model(
-            MODEL_NAME, DEVICE, compute_type=COMPUTE_TYPE, use_auth_token=HF_TOKEN
-        )
+        if ckpt and ckpt.has(_CKPT_ASR):
+            log.info("[2/7] cache hit: ASR result")
+            with _timed(timings, "asr"):
+                result = ckpt.load_json(_CKPT_ASR)
+        else:
+            with _timed(timings, "asr"):
+                log.info(
+                    "[2/7] loading ASR model %s on %s (compute_type=%s)",
+                    MODEL_NAME,
+                    DEVICE,
+                    COMPUTE_TYPE,
+                )
+                model = whisperx.load_model(
+                    MODEL_NAME,
+                    DEVICE,
+                    compute_type=COMPUTE_TYPE,
+                    use_auth_token=HF_TOKEN,
+                )
+                log.info("[2/7] loading audio: %s", audio_path)
+                audio = whisperx.load_audio(audio_path)
+                log.info("[2/7] transcribing (batch_size=%d)", batch_size)
+                result = model.transcribe(
+                    audio, batch_size=batch_size, language=language
+                )
+                # 3. free ASR model before touching alignment ----------------- #
+                log.info("[3/7] releasing ASR model")
+                release_model(model)
+            if ckpt:
+                ckpt.save_json(_CKPT_ASR, result)
 
-        log.info("[2/7] loading audio: %s", audio_path)
-        audio = whisperx.load_audio(audio_path)
-
-        log.info("[2/7] transcribing (batch_size=%d)", batch_size)
-        result = model.transcribe(audio, batch_size=batch_size, language=language)
         detected_language = result.get("language", language)
 
-        # 3. free ASR model before touching alignment --------------------- #
-        log.info("[3/7] releasing ASR model")
-        release_model(model)
+        # align + diarize both need the audio array; load it if ASR was cached.
+        if audio is None:
+            audio = whisperx.load_audio(audio_path)
 
         # 4. alignment ----------------------------------------------------- #
-        try:
-            log.info("[4/7] aligning timestamps (language=%s)", detected_language)
-            align_model, align_meta = whisperx.load_align_model(
-                detected_language, DEVICE
-            )
-            result = whisperx.align(
-                result["segments"],
-                align_model,
-                align_meta,
-                audio,
-                DEVICE,
-                return_char_alignments=False,
-            )
-            log.info("[4/7] releasing alignment model")
-            release_model(align_model)
-        except Exception as exc:
-            # Alignment only refines word boundaries; if the language is
-            # unsupported we fall back to the unaligned segments rather than
-            # failing the job.
-            log.warning(
-                "[4/7] timestamp alignment skipped (%s); using unaligned segments", exc
-            )
+        if ckpt and ckpt.has(_CKPT_ALIGNED):
+            log.info("[4/7] cache hit: aligned result")
+            with _timed(timings, "align"):
+                result = ckpt.load_json(_CKPT_ALIGNED)
+        else:
+            with _timed(timings, "align"):
+                try:
+                    log.info(
+                        "[4/7] aligning timestamps (language=%s)", detected_language
+                    )
+                    align_model, align_meta = whisperx.load_align_model(
+                        detected_language, DEVICE
+                    )
+                    result = whisperx.align(
+                        result["segments"],
+                        align_model,
+                        align_meta,
+                        audio,
+                        DEVICE,
+                        return_char_alignments=False,
+                    )
+                    log.info("[4/7] releasing alignment model")
+                    release_model(align_model)
+                except Exception as exc:
+                    # Alignment only refines word boundaries; if the language is
+                    # unsupported we fall back to the unaligned segments.
+                    log.warning(
+                        "[4/7] timestamp alignment skipped (%s); using unaligned segments",
+                        exc,
+                    )
+            if ckpt:
+                ckpt.save_json(_CKPT_ALIGNED, result)
 
         # 5. diarization --------------------------------------------------- #
-        if not HF_TOKEN:
-            raise RuntimeError(
-                "HF_TOKEN is not set. The diarization model is gated; set HF_TOKEN in .env."
-            )
-        log.info("[5/7] running diarization")
-        diarize_pipeline = DiarizationPipeline(token=HF_TOKEN, device=DEVICE)
-        diarize_segments = diarize_pipeline(
-            audio, min_speakers=min_speakers, max_speakers=max_speakers
-        )
-        log.info("[5/7] releasing diarization pipeline")
-        release_model(diarize_pipeline)
+        if ckpt and ckpt.has(_CKPT_DIARIZE):
+            log.info("[5/7] cache hit: diarization")
+            with _timed(timings, "diarize"):
+                rows = ckpt.load_json(_CKPT_DIARIZE)
+                diarize_segments = pd.DataFrame(
+                    rows, columns=["start", "end", "speaker"]
+                )
+        else:
+            with _timed(timings, "diarize"):
+                if not HF_TOKEN:
+                    raise RuntimeError(
+                        "HF_TOKEN is not set. The diarization model is gated; "
+                        "set HF_TOKEN in .env."
+                    )
+                log.info("[5/7] running diarization")
+                diarize_kwargs: dict = {"token": HF_TOKEN, "device": DEVICE}
+                if DIARIZE_MODEL:
+                    diarize_kwargs["model_name"] = DIARIZE_MODEL
+                diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
+                diarize_segments = diarize_pipeline(
+                    audio, min_speakers=min_speakers, max_speakers=max_speakers
+                )
+                log.info("[5/7] releasing diarization pipeline")
+                release_model(diarize_pipeline)
+            if ckpt:
+                rows = [
+                    {
+                        "start": float(r["start"]),
+                        "end": float(r["end"]),
+                        "speaker": str(r["speaker"]),
+                    }
+                    for _, r in diarize_segments[["start", "end", "speaker"]].iterrows()
+                ]
+                ckpt.save_json(_CKPT_DIARIZE, rows)
 
         # 6. assign speakers ----------------------------------------------- #
         log.info("[6/7] assigning speakers to segments")
-        result = whisperx.assign_word_speakers(diarize_segments, result)
+        with _timed(timings, "assign"):
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+        if ckpt:
+            ckpt.save_json(_CKPT_FINAL, result)
 
         # 7. build the clean script payload -------------------------------- #
         log.info("[7/7] building script payload")
-        script = build_script(result)
-        log.info("[done] pipeline complete: %d segments", len(script))
+        with _timed(timings, "build"):
+            script = build_script(result)
+        if ckpt:
+            ckpt.save_json(_CKPT_SCRIPT, script)
+            ckpt.record(status="completed", timings=timings)
+
+        log.info(
+            "[done] pipeline complete: %d segments in %.1fs "
+            "(convert %.1f, asr %.1f, align %.1f, diarize %.1f, assign %.1f, build %.1f)",
+            len(script),
+            time.perf_counter() - total_t0,
+            timings.get("convert", 0.0),
+            timings.get("asr", 0.0),
+            timings.get("align", 0.0),
+            timings.get("diarize", 0.0),
+            timings.get("assign", 0.0),
+            timings.get("build", 0.0),
+        )
         return script
     finally:
-        shutil.rmtree(convert_dir, ignore_errors=True)
+        if convert_dir:
+            shutil.rmtree(convert_dir, ignore_errors=True)
 
 
 def build_script(result: dict) -> list[dict]:
@@ -271,6 +555,7 @@ async def transcribe_async(
     language: Optional[str] = None,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
+    resume: bool = RESUME,
 ) -> list[dict]:
     """Run the blocking pipeline in a worker thread so the loop stays responsive."""
     return await asyncio.to_thread(
@@ -279,6 +564,7 @@ async def transcribe_async(
         language=language,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        resume=resume,
     )
 
 
@@ -297,6 +583,7 @@ async def create_transcription_task(
     language: Optional[str] = None,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
+    resume: Optional[bool] = None,
 ) -> dict:
     """Accept an audio upload and kick off an asynchronous transcription job."""
     task_id = uuid.uuid4().hex
@@ -313,11 +600,18 @@ async def create_transcription_task(
         "result": None,
         "error": None,
     }
-    log.info("queued task %s (%s)", task_id, in_path.name)
+    use_resume = RESUME if resume is None else resume
+    log.info("queued task %s (%s, resume=%s)", task_id, in_path.name, use_resume)
 
     asyncio.create_task(
         _run_transcription_task(
-            task_id, str(in_path), language, min_speakers, max_speakers, workdir
+            task_id,
+            str(in_path),
+            language,
+            min_speakers,
+            max_speakers,
+            workdir,
+            use_resume,
         )
     )
     return {"task_id": task_id, "status": "pending"}
@@ -330,6 +624,7 @@ async def _run_transcription_task(
     min_speakers: Optional[int],
     max_speakers: Optional[int],
     workdir: Path,
+    resume: bool,
 ) -> None:
     """Worker that drives a task through processing -> completed/failed."""
     task = _tasks[task_id]
@@ -340,6 +635,7 @@ async def _run_transcription_task(
             language=language,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
+            resume=resume,
         )
         task["status"] = "completed"
         log.info("task %s completed", task_id)
@@ -380,6 +676,7 @@ def cli_transcribe(args: argparse.Namespace) -> int:
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
         batch_size=args.batch_size,
+        resume=RESUME and not args.no_resume,
     )
 
     # --json dumps the raw payload to stdout and skips the formatted file.
@@ -429,6 +726,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=BATCH_SIZE,
         help="ASR batch size (smaller = less memory).",
+    )
+    p_transcribe.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore saved checkpoints and run the full pipeline from scratch.",
     )
     p_transcribe.add_argument(
         "--format",
