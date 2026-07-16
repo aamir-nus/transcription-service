@@ -36,8 +36,10 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Always refresh from .env so config changes are picked up without a reinstall.
-load_dotenv(override=True)
+# Load .env as defaults, but let an explicit shell/exported var win. This keeps
+# config-overridable-from-the-environment (e.g. the benchmark can force
+# DEVICE=cpu per run) while still picking up .env changes without a reinstall.
+load_dotenv(override=False)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
