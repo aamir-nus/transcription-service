@@ -62,9 +62,37 @@ HF_TOKEN: Optional[str] = os.getenv(
     "HF_TOKEN"
 )  # required for the gated diarization model
 MODEL_NAME: str = os.getenv("TRANSCRIPTION_MODEL", "large-v3-turbo")
-DEVICE: str = os.getenv("DEVICE", "cpu")
-COMPUTE_TYPE: str = os.getenv("COMPUTE_TYPE", "default")
+COMPUTE_TYPE: str = os.getenv("COMPUTE_TYPE", "int8")
 BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "8"))
+
+
+def _resolve_device(preferred: Optional[str]) -> str:
+    """Map 'auto'/None to the best available accelerator; honor explicit names.
+
+    Used for the pure-PyTorch stages (alignment + diarization), which DO benefit
+    from MPS on Apple Silicon. ASR is separate (see ASR_DEVICE): faster-whisper
+    (CTranslate2) has no Metal/MPS backend, so it is always CPU-bound.
+    """
+    if preferred and preferred.lower() != "auto":
+        return preferred.lower()
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+# PyTorch stages (align + diarize): MPS when available. Default 'auto' picks the
+# best accelerator; set DEVICE=cpu to force the old slow path for debugging.
+PIPELINE_DEVICE: str = _resolve_device(os.getenv("DEVICE", "auto"))
+# ASR stage: faster-whisper/CTranslate2 -- CPU only (no MPS backend exists).
+# Override with ASR_DEVICE only if you have a faster-whisper build that supports
+# another device; otherwise leave as 'cpu'.
+ASR_DEVICE: str = (os.getenv("ASR_DEVICE") or "cpu").lower()
+# faster-whisper CPU thread count. whisperx defaults to 4, which leaves half the
+# cores idle on Apple Silicon (8 cores) -- a real ASR bottleneck. Default to all
+# logical cores.
+ASR_THREADS: int = int(os.getenv("ASR_THREADS", str(max(1, os.cpu_count() or 4))))
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -205,13 +233,14 @@ def _cache_params(
     """
     return {
         "model": MODEL_NAME,
-        "device": DEVICE,
+        "asr_device": ASR_DEVICE,
+        "pipeline_device": PIPELINE_DEVICE,
         "compute_type": COMPUTE_TYPE,
+        "threads": ASR_THREADS,
         "diarize_model": DIARIZE_MODEL or "default",
         "language": language,  # None == auto-detect
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
-        "whisperx": getattr(whisperx, "__version__", "unknown"),
     }
 
 
@@ -396,15 +425,17 @@ def run_pipeline(
         else:
             with _timed(timings, "asr"):
                 log.info(
-                    "[2/7] loading ASR model %s on %s (compute_type=%s)",
+                    "[2/7] loading ASR model %s on %s (compute_type=%s, threads=%d)",
                     MODEL_NAME,
-                    DEVICE,
+                    ASR_DEVICE,
                     COMPUTE_TYPE,
+                    ASR_THREADS,
                 )
                 model = whisperx.load_model(
                     MODEL_NAME,
-                    DEVICE,
+                    ASR_DEVICE,
                     compute_type=COMPUTE_TYPE,
+                    threads=ASR_THREADS,
                     use_auth_token=HF_TOKEN,
                 )
                 log.info("[2/7] loading audio: %s", audio_path)
@@ -434,17 +465,19 @@ def run_pipeline(
             with _timed(timings, "align"):
                 try:
                     log.info(
-                        "[4/7] aligning timestamps (language=%s)", detected_language
+                        "[4/7] aligning timestamps (language=%s, device=%s)",
+                        detected_language,
+                        PIPELINE_DEVICE,
                     )
                     align_model, align_meta = whisperx.load_align_model(
-                        detected_language, DEVICE
+                        detected_language, PIPELINE_DEVICE
                     )
                     result = whisperx.align(
                         result["segments"],
                         align_model,
                         align_meta,
                         audio,
-                        DEVICE,
+                        PIPELINE_DEVICE,
                         return_char_alignments=False,
                     )
                     log.info("[4/7] releasing alignment model")
@@ -474,8 +507,8 @@ def run_pipeline(
                         "HF_TOKEN is not set. The diarization model is gated; "
                         "set HF_TOKEN in .env."
                     )
-                log.info("[5/7] running diarization")
-                diarize_kwargs: dict = {"token": HF_TOKEN, "device": DEVICE}
+                log.info("[5/7] running diarization (device=%s)", PIPELINE_DEVICE)
+                diarize_kwargs: dict = {"token": HF_TOKEN, "device": PIPELINE_DEVICE}
                 if DIARIZE_MODEL:
                     diarize_kwargs["model_name"] = DIARIZE_MODEL
                 diarize_pipeline = DiarizationPipeline(**diarize_kwargs)

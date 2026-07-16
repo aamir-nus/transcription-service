@@ -36,6 +36,48 @@ per-stage breakdown:
 [done] pipeline complete: 412 segments in 98.4s (convert 1.2, asr 42.3, align 8.1, diarize 40.5, assign 0.4, build 0.1)
 ```
 
+## Performance & device strategy
+
+The pipeline stages run on **different devices by design** — this is the single
+biggest performance lever on Apple Silicon, because the two heaviest stages sit
+on different backends:
+
+| stage    | device | why                                                                 |
+| -------- | ------ | ------------------------------------------------------------------- |
+| ASR      | `cpu`  | faster-whisper (CTranslate2) has **no MPS backend** — always CPU    |
+| Align    | `mps`  | wav2vec2 (PyTorch) — MPS is faster                                  |
+| Diarize  | `mps`  | pyannote (PyTorch) — **MPS is ~8× faster** than CPU here            |
+
+Diarization was the bottleneck: on CPU it runs **slower than real-time**
+(1718s audio → 1146s diarize), because the segmentation/embedding forward
+passes are expensive without a GPU. MPS drops that to ~real-time-faster. ASR is
+already near its CPU ceiling (~0.3× real-time, `int8`); neither thread count nor
+batch size moves it — `int8` is memory-bandwidth-bound on CTranslate2.
+
+Config (`.env`):
+
+- `DEVICE=auto` — picks MPS when available (the PyTorch stages); set `cpu` to
+  force the slow path for debugging.
+- `ASR_DEVICE=cpu` — faster-whisper can't use MPS; leave as `cpu`.
+- `ASR_THREADS=8` — defaults to all cores (whisperX capped this at 4).
+- `COMPUTE_TYPE=int8` — optimal for CPU ASR.
+
+### Benchmarking short clips
+
+`benchmarks/bench_transcribe.py` runs the pipeline on 90s/120s snippets, prints
+per-stage wall-clock + real-time factor, and compares the transcript against the
+matching window of a known-good full-file baseline (quality check). Snippets are
+created on demand in `Data/` from `s3-and-research.opus`.
+
+```bash
+uv run python3 benchmarks/bench_transcribe.py                 # default matrix
+uv run python3 benchmarks/bench_transcribe.py --devices mps cpu
+```
+
+> ⚠️ Short clips (90s/120s) **understate** the diarization win — it scales
+> super-linearly on CPU, so the gap only opens at scale. Use a 600s+ clip (or
+> the full file) to see the real speedup.
+
 ## Resume & checkpointing
 
 A run can fail at any of the seven steps (OOM, a gated-model 401, …). To avoid
@@ -61,8 +103,9 @@ steps 5–7 re-run — the multi-gigabyte transcription is reused.
 
 Cache-hit stages are logged (`[5/7] cache hit: diarization`). The cache key
 excludes `batch_size` (it doesn't change the output), so tweaking it for memory
-won't bust the cache. It **does** include model name, device, compute type,
-language, speaker bounds, diarization model, and the WhisperX version.
+won't bust the cache. It **does** include model name, the per-stage devices
+(`asr_device`, `pipeline_device`), compute type, thread count, language, speaker
+bounds, and the diarization model.
 
 - CLI: `--no-resume` ignores the cache and runs the full pipeline.
 - HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
