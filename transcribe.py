@@ -30,6 +30,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -40,6 +41,17 @@ from dotenv import load_dotenv
 # config-overridable-from-the-environment (e.g. the benchmark can force
 # DEVICE=cpu per run) while still picking up .env changes without a reinstall.
 load_dotenv(override=False)
+
+# pyannote hard-imports torchcodec and warns noisily when its native lib fails to
+# load (the wheel can't resolve Homebrew's FFmpeg dylibs on macOS, and brew's
+# ffmpeg 8 is newer than torchcodec 0.7's supported FFmpeg 4-7). Harmless here:
+# WhisperX always hands diarization an in-memory waveform dict, so pyannote's
+# torchcodec-based *file* decoding is never exercised. Silence just this warning.
+warnings.filterwarnings(
+    "ignore",
+    message=r"\s*torchcodec is not installed correctly.*",
+    category=UserWarning,
+)
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
