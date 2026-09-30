@@ -19,3 +19,6 @@ CLAUDE.md
 
 # Resume checkpoints (transcribed artifacts, kept local)
 .transcribe_cache
+
+# macOS cruft
+.DS_Store
