@@ -15,6 +15,7 @@ wheels/
 Data
 Output
 Outputs
+CLAUDE.md
 
 # Resume checkpoints (transcribed artifacts, kept local)
 .transcribe_cache
