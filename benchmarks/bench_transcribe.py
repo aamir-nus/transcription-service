@@ -217,6 +217,23 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+def _wer(ref: str, hyp: str) -> float:
+    """Word error rate of `hyp` against `ref` (both normalized text).
+
+    Unlike the char-level similarity, WER is comparable across ASR backends:
+    char similarity collapses when decoder styles differ (fillers, punctuation)
+    even when the words are the same.
+    """
+    ref_w, hyp_w = ref.split(), hyp.split()
+    dp = list(range(len(hyp_w) + 1))
+    for i, rw in enumerate(ref_w, 1):
+        prev, dp[0] = dp[0], i
+        for j, hw in enumerate(hyp_w, 1):
+            cur = min(dp[j] + 1, dp[j - 1] + 1, prev + (rw != hw))
+            prev, dp[j] = dp[j], cur
+    return dp[-1] / max(1, len(ref_w))
+
+
 def compare_to_baseline(run: RunResult, window: float) -> dict:
     """Compare run's transcript to the baseline's first `window` seconds."""
     if not run.vtt_path or not run.vtt_path.exists() or not BASELINE_VTT.exists():
@@ -233,6 +250,7 @@ def compare_to_baseline(run: RunResult, window: float) -> dict:
     base_spk = [r[2] for r in base_rows]
     return {
         "similarity": sim,
+        "wer": _wer(base_text, run_text),
         "run_segments": len(run_rows),
         "base_segments": len(base_rows),
         "run_speakers": sorted(set(run_spk)),
@@ -264,7 +282,7 @@ def print_report(results: list[RunResult], window_by_snippet: dict[str, float]) 
     print("\n" + "=" * 78)
     print("QUALITY (transcript text vs full-file baseline, first N seconds)")
     print("=" * 78)
-    print(f"{'run':<26}{'sim':>7}{'run_seg':>9}{'base_seg':>9}  speakers")
+    print(f"{'run':<26}{'sim':>7}{'wer':>7}{'run_seg':>9}{'base_seg':>9}  speakers")
     print("-" * 78)
     for r in results:
         if r.error or not r.vtt_path:
@@ -275,9 +293,11 @@ def print_report(results: list[RunResult], window_by_snippet: dict[str, float]) 
         q = compare_to_baseline(r, window)
         sim = q["similarity"]
         simstr = f"{sim:.3f}" if sim is not None else "  n/a"
+        wer = q.get("wer")
+        werstr = f"{wer:.3f}" if wer is not None else "  n/a"
         spk = ",".join(q.get("run_speakers") or []) or "-"
         print(
-            f"{r.label:<26}{simstr:>7}{q.get('run_segments', '-'):>9}"
+            f"{r.label:<26}{simstr:>7}{werstr:>7}{q.get('run_segments', '-'):>9}"
             f"{q.get('base_segments', '-'):>9}  {spk}"
         )
     print()

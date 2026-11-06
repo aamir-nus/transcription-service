@@ -19,13 +19,13 @@ Output/                         # default transcription output location (created
 
 ## Pipeline
 
-The engine (`run_pipeline`) runs strictly one stage at a time, freeing each model before loading the next to keep memory flat. Logs are tagged `[n/7]` so you can see which step is running:
+The engine (`run_pipeline`) runs one model at a time on the critical path, freeing each model before loading the next to keep memory flat — with one structural exception: **diarization depends only on the audio**, so it runs on a worker thread in parallel with ASR+alignment whenever both halves need computing (`PARALLEL_STAGES`). Logs are tagged `[n/7]` so you can see which step is running:
 
 1. **`[1/7]` Convert** — normalize the input to 16 kHz mono mp3 via ffmpeg (any container: mp3, m4a, wav, aac, ogg, flac, …).
-2. **`[2/7]` Transcribe** — load `large-v3-turbo`, load audio, run ASR with a small batch size.
-3. **`[3/7]` Free ASR** — drop the model, reclaim memory.
+2. **`[2/7]` Transcribe** — load `large-v3-turbo` and transcribe. On Apple Silicon the default backend is **MLX whisper on the Apple GPU** (fp16), with the audio first split into speech chunks by whisperx's own VAD; faster-whisper/CTranslate2 (CPU) is the fallback backend (`ASR_BACKEND`).
+3. **`[3/7]` Free ASR** — drop the model, reclaim memory (CT2 backend; the MLX model stays cached in-process).
 4. **`[4/7]` Align** — load the alignment model, refine word timestamps, free it. (Skipped gracefully on unsupported languages.)
-5. **`[5/7]` Diarize** — load the WhisperX diarization pipeline using `HF_TOKEN`, detect speakers, free it.
+5. **`[5/7]` Diarize** — load the WhisperX diarization pipeline using `HF_TOKEN`, detect speakers, free it (runs in parallel with 2–4 when both halves need computing).
 6. **`[6/7]` Assign speakers** — map speakers onto segments.
 7. **`[7/7]` Build script** — emit a list of `{ "time": { "start", "end" }, "speaker", "text" }`.
 
@@ -38,35 +38,55 @@ per-stage breakdown:
 
 ## Performance & device strategy
 
-The pipeline stages run on **different devices by design** — this is the single
-biggest performance lever on Apple Silicon, because the two heaviest stages sit
-on different backends:
+The pipeline stages run on **different backends by design** — this is the single
+biggest performance lever on Apple Silicon:
 
-| stage    | device | why                                                                 |
-| -------- | ------ | ------------------------------------------------------------------- |
-| ASR      | `cpu`  | faster-whisper (CTranslate2) has **no MPS backend** — always CPU    |
-| Align    | `mps`  | wav2vec2 (PyTorch) — MPS is faster                                  |
-| Diarize  | `mps`  | pyannote (PyTorch) — **MPS is ~8× faster** than CPU here            |
+| stage    | backend | why                                                                     |
+| -------- | ------- | ----------------------------------------------------------------------- |
+| ASR      | MLX     | whisper on the **Apple GPU** (Metal, fp16) — ~5× faster than CPU int8   |
+| Align    | `mps`   | wav2vec2 (PyTorch) — MPS is faster                                      |
+| Diarize  | `mps`   | pyannote (PyTorch) — **MPS is ~8× faster** than CPU here                |
 
-Diarization was the bottleneck: on CPU it runs **slower than real-time**
-(1718s audio → 1146s diarize), because the segmentation/embedding forward
-passes are expensive without a GPU. MPS drops that to ~real-time-faster. ASR is
-already near its CPU ceiling (~0.3× real-time, `int8`); neither thread count nor
-batch size moves it — `int8` is memory-bandwidth-bound on CTranslate2.
+ASR has two interchangeable backends, selected by `ASR_BACKEND`:
+
+- **`mlx`** (default on Apple Silicon, `auto`): `mlx-community` conversions of
+  the same OpenAI weights, run on the Apple GPU. The audio is first split into
+  speech chunks with whisperx's Pyannote VAD — the exact chunker the ct2
+  backend uses — because whisper's fixed 30s windowing over unchunked audio
+  skips speech and repetition-loops (a known turbo artifact).
+- **`ct2`**: faster-whisper/CTranslate2 on CPU (`ASR_DEVICE`, `COMPUTE_TYPE`,
+  `ASR_THREADS`). CTranslate2 has no MPS backend and is memory-bandwidth-bound
+  at `int8` — on a 4-performance-core Apple Silicon chip it runs slower than
+  real-time, which is why MLX is the default.
+
+Since all three heavy stages share the one GPU, diarization runs in parallel
+with ASR+alignment (`PARALLEL_STAGES`, default on with the mlx backend); each
+stage slows under contention but the wall-clock drops ~20%.
 
 Config (`.env`):
 
 - `DEVICE=auto` — picks MPS when available (the PyTorch stages); set `cpu` to
   force the slow path for debugging.
-- `ASR_DEVICE=cpu` — faster-whisper can't use MPS; leave as `cpu`.
-- `ASR_THREADS=8` — defaults to all cores (whisperX capped this at 4).
-- `COMPUTE_TYPE=int8` — optimal for CPU ASR.
+- `ASR_BACKEND=auto` — `mlx` | `ct2` | `auto` (auto = mlx when available).
+- `MLX_MODEL=` — override the MLX repo (default: mapped from
+  `TRANSCRIPTION_MODEL`, e.g. `large-v3-turbo` → `mlx-community/whisper-large-v3-turbo`).
+- `ASR_DEVICE=cpu` / `ASR_THREADS` / `COMPUTE_TYPE=int8` — ct2 backend only.
+- `PARALLEL_STAGES=auto` — run diarization alongside ASR+alignment
+  (`true`/`false` force; `auto` = on with the mlx backend).
+
+Measured on a base M2 (4 P-cores, 16 GB): a 10-minute WebEx recording runs the
+full pipeline in ~115s (~5× real-time); the same file on the pre-MLX stack took
+~5× longer. Short clips are dominated by model-load time (~3–4s total).
 
 ### Benchmarking short clips
 
 `benchmarks/bench_transcribe.py` runs the pipeline on 90s/120s snippets, prints
 per-stage wall-clock + real-time factor, and compares the transcript against the
-matching window of a known-good full-file baseline (quality check). Snippets are
+matching window of a known-good full-file baseline (quality check): char-level
+similarity **and word error rate**. WER is the metric to watch when comparing
+across ASR backends — char similarity collapses when decoder styles differ
+(fillers, punctuation) even when the words are the same. Set `ASR_BACKEND=ct2`
+in the environment to bench the fallback backend head-to-head. Snippets are
 created on demand in `Data/` from `s3-and-research.opus`.
 
 ```bash
@@ -103,9 +123,9 @@ steps 5–7 re-run — the multi-gigabyte transcription is reused.
 
 Cache-hit stages are logged (`[5/7] cache hit: diarization`). The cache key
 excludes `batch_size` (it doesn't change the output), so tweaking it for memory
-won't bust the cache. It **does** include model name, the per-stage devices
-(`asr_device`, `pipeline_device`), compute type, thread count, language, speaker
-bounds, and the diarization model.
+won't bust the cache. It **does** include model name, ASR backend, the per-stage
+devices (`asr_device`, `pipeline_device`), compute type, thread count, language,
+speaker bounds, and the diarization model.
 
 - CLI: `--no-resume` ignores the cache and runs the full pipeline.
 - HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
@@ -146,9 +166,14 @@ Create a `.env` (already present — edit to taste):
 ```dotenv
 HF_TOKEN=hf_xxx               # required for diarization
 TRANSCRIPTION_MODEL=large-v3-turbo
-DEVICE=mps                    # cpu | cuda | mps
-COMPUTE_TYPE=int8             # NOTE: int8 (CUDA) requires CUDA (see below)
-BATCH_SIZE=8                  # smaller = less memory
+DEVICE=mps                    # cpu | cuda | mps (align + diarize)
+ASR_BACKEND=auto              # mlx | ct2 | auto (auto = mlx on Apple Silicon)
+MLX_MODEL=                    # explicit MLX repo (default: mapped from TRANSCRIPTION_MODEL)
+ASR_DEVICE=cpu                # ct2 backend only (faster-whisper has no MPS)
+ASR_THREADS=8                 # ct2 backend only
+COMPUTE_TYPE=int8             # ct2 backend only
+PARALLEL_STAGES=auto          # diarization ∥ ASR+alignment (true | false | auto)
+BATCH_SIZE=8                  # ct2 backend only; smaller = less memory
 HOST=0.0.0.0
 PORT=8000
 DATA_DIR=Data                 # default input audio directory
