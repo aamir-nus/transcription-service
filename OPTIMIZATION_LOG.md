@@ -81,3 +81,42 @@ similarity collapses when decoder styles differ (fillers/punctuation).
    225-vs-127 cue granularity difference bothers anyone.
 4. Kernel-level work: premature per project guidance — exhaust API/library
    level first.
+
+## Direction opened 2026-11-06 — diarization as streaming source separation
+
+User prompt: borrow from live TTS / streaming voice models; rethink diarization
+as source signal separation on a live stream. Lit scan grounded on: Sortformer
+(NVIDIA 2025, simultaneous sorting+separation), NSD-MS2S (memory-aware
+multi-speaker embeddings, CHiME-7 best), Nemotron-3-Diarization (100M open
+weights, streaming, 14.7% DER), TS-VAD → OTS-VAD/EDA-TS-VAD (online target-
+speaker VAD), Diart, SSND. Conclusions:
+
+- **The inversion**: separate the mix into K per-speaker signals first → label
+  = stream identity; clustering + word-assignment stages dissolve; overlapped
+  speech (whisper transcribes only the dominant talker today) becomes
+  recoverable — that's where the remaining WebEx WER lives.
+- **Borrowed principles**: (1) causality w/ small lookahead beats global
+  context (who-spoke-when is decidable frame-by-frame); (2) memory/enrollment
+  instead of clustering — NSD-MS2S's online voice profiles are the same
+  embedding trick zero-shot TTS uses for cloning; gives stable cross-file
+  labels ("Aamir", not a fresh SPEAKER_00); (3) structure tasks need small
+  models — 100M streaming diarization beats big systems; right budget for
+  16 GB M2; (4) separation for WHO, mixture for WHAT — ASR on separated audio
+  loses WER to artifacts, so whisper keeps the original mix as input.
+- **Honest wall-clock take**: diarize is already hidden under ASR via
+  PARALLEL_STAGES — this direction buys overlap-region WER, identity
+  stability, and time-to-first-transcript (w/ streaming refactor), NOT total
+  runtime. ASR stays the runtime lever.
+- **Next experiments (ranked, small first)**:
+  1. WebEx "record individual audio tracks" at capture = free exact
+     separation. Check recording settings BEFORE building anything.
+  2. Enrollment on the existing stack, no new deps: per-speaker embedding
+     centroids from diarize.json turns → persist to disk → match on later
+     files → stable speaker names across meetings.
+  3. Offline eval of Nemotron-3-Diarization (or Sortformer) on an
+     overlap-heavy 2-speaker clip. Gate: beats pyannote DER in overlap
+     regions ONLY, then consider integration behind PARALLEL_STAGES.
+  4. Full streaming producer-consumer refactor: DEFER — changes the batch
+     CLI/API contract; latency-to-first-word is not a current requirement.
+- **Do NOT** transcribe separated streams (artifacts hurt WER; the mixture
+  stays the ASR input).
