@@ -164,3 +164,36 @@ needed).
   directly, no encoder→text input mapping) that identifies repeated audio
   signals and does anaphora/entity resolution to map speaker tags to entities.
   Strictly future scope; recorded so it isn't lost.
+
+## 2026-11-07 — SHIPPED: speaker enrollment (stable tags across files)
+
+Implementation: `return_embeddings=True` on the whisperx diarize call returns
+pyannote's own per-speaker wespeaker centroids (256-dim, zero extra inference).
+Each file's local centroids are cosine-matched against `.speakers.json`
+(flock-guarded, atomic replace, n-weighted running-mean update); matched voices
+keep their global tag, new voices take `SPEAKER_{next_tag}` in first-appearance
+order. `speaker_linking` joined the cache key (one-time invalidation, ASR-
+backend precedent); cache hits return frozen tags by design. Bench runs set
+`SPEAKER_LINKING=false` to keep the speaker column comparable.
+
+**Calibration** (aamir-minsuk-1-1_0411.opus → aamir-minsuk-1on1-aug-20.opus,
+same two speakers, one enrolled then the other linked):
+
+- same-voice cross-file cosines: **0.833, 0.775**
+- different-voice cosines: **0.460, 0.382**
+- gap 0.315 → threshold set at **0.70** (`SPEAKER_LINK_THRESHOLD`): 0.075
+  below the lowest positive, 0.24 above the highest negative, biased high
+  because a missed match only costs one extra tag while a false merge corrupts
+  two identities.
+- file 2's diarizer had *swapped* the local labels; linking mapped each voice
+  to its true global tag through the permutation — exactly the failure mode
+  per-file labels have.
+
+Linking cost: 0.00–0.01s per file (pure vector math, off the model path).
+
+Verified: full-script cache hit returns frozen tags with the store
+byte-identical; `SPEAKER_LINKING=false` writes turns-only diarize.json and
+never touches the store; sequential (`PARALLEL_STAGES=false`) and parallel
+diarize paths both link; 8-process enrollment hammer on a shared store →
+unique tags, second wave re-links every voice at cos 1.000, `next_tag` stable,
+store clean after 16 lock-guarded writes.

@@ -20,6 +20,7 @@ All configuration is read from environment variables (see .env).
 
 import argparse
 import asyncio
+import fcntl
 import gc
 import hashlib
 import json
@@ -33,6 +34,7 @@ import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -167,6 +169,27 @@ DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
 # one GPU but interleave well); 'true'/'false' force it on/off.
 PARALLEL_STAGES: str = (os.getenv("PARALLEL_STAGES") or "auto").lower()
 
+# Speaker memory: link diarized voices to stable SPEAKER_XX tags across files.
+# Diarization already computes per-speaker centroid embeddings internally (for
+# its own clustering); with linking on we also ask for them (no extra
+# inference) and match them against a small on-disk store, so the same voice
+# keeps the same tag in every file (new voices get the next unused tag).
+# 'false' restores per-file labels and skips the store entirely.
+SPEAKER_LINKING: bool = (os.getenv("SPEAKER_LINKING") or "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# The store (tags + centroids). Gitignored; deleting it resets the namespace.
+SPEAKER_STORE: Path = Path(os.getenv("SPEAKER_STORE", ".speakers.json"))
+# Cosine threshold above which a file speaker counts as a stored voice.
+# Calibrated on two recordings with the same speaker pair (see
+# OPTIMIZATION_LOG.md) and biased high: a missed match only costs one extra
+# tag, a false merge corrupts two identities. Same-voice cross-file cosines
+# measured 0.775-0.833; different-voice pairs 0.382-0.460.
+SPEAKER_MATCH_THRESHOLD: float = float(os.getenv("SPEAKER_LINK_THRESHOLD", "0.70"))
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -260,7 +283,9 @@ def convert_to_mp3(
 #   converted.mp3     [1] normalized audio
 #   asr.json          [2] raw ASR result (the expensive one)
 #   aligned.json      [4] word-aligned result
-#   diarize.json      [5] speaker turns as [{"start","end","speaker"}, ...]
+#   diarize.json      [5] {"turns": [{"start","end","speaker"}, ...],
+#                     "embeddings": {tag: centroid}} -- the embeddings half is
+#                     present only when speaker linking is on
 #   final.json        [6] result after speaker assignment
 #   script.json       [7] the final clean script
 _CKPT_AUDIO = "converted.mp3"
@@ -301,6 +326,7 @@ def _cache_params(
         "language": language,  # None == auto-detect
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
+        "speaker_linking": SPEAKER_LINKING,
     }
 
 
@@ -519,12 +545,15 @@ def _run_diarization(
     audio: "np.ndarray",
     min_speakers: Optional[int],
     max_speakers: Optional[int],
-) -> tuple["pd.DataFrame", float]:
+) -> tuple["pd.DataFrame", dict, float]:
     """Load the diarization pipeline, diarize ``audio``, free it.
 
-    Returns ``(segments frame, elapsed seconds)``. Runs on the main thread or
-    on the diarize worker; it must not touch the Checkpoint (meta.json races
-    with the main thread) -- the caller persists the result after joining.
+    Returns ``(segments frame, speaker centroids, elapsed seconds)``. With
+    SPEAKER_LINKING on, the centroids come back alongside the turns (they are
+    pyannote's own per-speaker embedding means, computed for its clustering
+    anyway -- no extra inference). Runs on the main thread or on the diarize
+    worker; it must not touch the Checkpoint (meta.json races with the main
+    thread) -- the caller persists the result after joining.
     """
     t0 = time.perf_counter()
     if not HF_TOKEN:
@@ -537,13 +566,220 @@ def _run_diarization(
         diarize_kwargs["model_name"] = DIARIZE_MODEL
     diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
     try:
-        segments = diarize_pipeline(
-            audio, min_speakers=min_speakers, max_speakers=max_speakers
-        )
+        if SPEAKER_LINKING:
+            segments, centroids = diarize_pipeline(
+                audio,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                return_embeddings=True,
+            )
+        else:
+            segments = diarize_pipeline(
+                audio, min_speakers=min_speakers, max_speakers=max_speakers
+            )
+            centroids = {}
     finally:
         log.info("[5/7] releasing diarization pipeline")
         release_model(diarize_pipeline)
-    return segments, time.perf_counter() - t0
+    return segments, (centroids or {}), time.perf_counter() - t0
+
+
+# --------------------------------------------------------------------------- #
+# Speaker memory (stable tags across files)
+# --------------------------------------------------------------------------- #
+# Diarization labels each file in isolation (SPEAKER_00, SPEAKER_01, ...), so
+# the same person gets a different tag in every recording. With SPEAKER_LINKING
+# on, one centroid per voice is kept in a small on-disk store and every new
+# file is relabeled against it: a known voice keeps its tag across all files,
+# a new voice takes the next unused tag (in first-appearance order). Tags are
+# deliberately anonymous -- stable identity, never names.
+_SPEAKER_STORE_VERSION = 1
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _unit_centroid(centroid: list[float]) -> Optional["np.ndarray"]:
+    """L2-normalized centroid as float64, or None if it is degenerate.
+
+    pyannote zero-pads centroids when its clustering finds fewer clusters than
+    labels; a zero vector carries no identity and must not be matched or
+    stored.
+    """
+    vec = np.asarray(centroid, dtype=np.float64)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-9:
+        return None
+    return vec / norm
+
+
+def _read_store() -> dict:
+    """Load the speaker store; a missing or corrupt store starts fresh.
+
+    A corrupt store is parked as ``.speakers.json.corrupt-<epoch>`` rather than
+    silently renumbering the tag namespace.
+    """
+    empty = {
+        "version": _SPEAKER_STORE_VERSION,
+        "next_tag": 0,
+        "speakers": [],
+    }
+    if not SPEAKER_STORE.exists():
+        return empty
+    try:
+        data = json.loads(SPEAKER_STORE.read_text(encoding="utf-8"))
+        if data.get("version") != _SPEAKER_STORE_VERSION:
+            raise ValueError(f"unknown store version {data.get('version')!r}")
+        return data
+    except Exception as exc:
+        backup = SPEAKER_STORE.with_name(
+            f"{SPEAKER_STORE.name}.corrupt-{int(time.time())}"
+        )
+        try:
+            os.replace(SPEAKER_STORE, backup)
+            parked = f"parked at {backup.name}"
+        except OSError:
+            parked = "could not park it"
+        log.warning("speaker store unreadable (%s); %s, starting fresh", exc, parked)
+        return empty
+
+
+def _write_store(store: dict) -> None:
+    """Atomically write the speaker store (tmp file + rename)."""
+    tmp = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, SPEAKER_STORE)
+
+
+def _link_speakers(
+    rows: list[dict], centroids: dict[str, list[float]], source_name: str
+) -> tuple[list[dict], dict[str, list[float]]]:
+    """Relabel per-file speaker tags to stable cross-file tags.
+
+    Matches each file speaker's centroid against the stored voices by cosine
+    similarity (best match per file speaker above ``SPEAKER_MATCH_THRESHOLD``;
+    two local labels may legitimately map to the same stored voice when
+    clustering over-split one person). New voices allocate the next unused tag.
+    The store is read and written under an exclusive lock on a sidecar lock
+    file, so concurrent jobs (CLI + server, or two API uploads) serialize
+    cleanly; the data file itself is always replaced atomically.
+
+    Returns ``(relabeled rows, centroids keyed by the global tag)`` and logs
+    every candidate similarity -- which doubles as the calibration instrument
+    (see OPTIMIZATION_LOG.md).
+    """
+    if not rows:
+        return rows, {}
+
+    # Local labels in order of first appearance (rows are time-ordered).
+    order: list[str] = []
+    for r in rows:
+        if r["speaker"] not in order:
+            order.append(r["speaker"])
+
+    local_unit = {tag: _unit_centroid(centroids.get(tag, [])) for tag in order}
+    for tag, unit in local_unit.items():
+        if unit is None:
+            log.info(
+                "[5/7] speaker linking: %s has a degenerate centroid; "
+                "it gets a tag but is not enrolled",
+                tag,
+            )
+
+    lock_path = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        store = _read_store()
+        stored: dict[str, dict] = {s["tag"]: s for s in store["speakers"]}
+        stored_unit = {tag: _unit_centroid(s["centroid"]) for tag, s in stored.items()}
+
+        # Best stored match per local label. All candidate scores are logged so
+        # the threshold can be calibrated from real runs.
+        candidates: list[tuple[float, str, str]] = []
+        for ltag in order:
+            lu = local_unit[ltag]
+            if lu is None:
+                continue
+            for gtag, gu in stored_unit.items():
+                if gu is None:
+                    continue
+                candidates.append((float(np.dot(lu, gu)), ltag, gtag))
+        if candidates:
+            log.info(
+                "[5/7] speaker linking candidates: %s",
+                ", ".join(
+                    f"{local}->{glob} {score:.3f}"
+                    for score, local, glob in sorted(candidates, reverse=True)
+                ),
+            )
+        matched: dict[str, tuple[float, str]] = {}
+        for score, ltag, gtag in sorted(candidates, reverse=True):
+            if score < SPEAKER_MATCH_THRESHOLD:
+                break
+            if ltag not in matched:  # keep each local label's best match only
+                matched[ltag] = (score, gtag)
+
+        label_map: dict[str, str] = {}
+        embeddings_out: dict[str, list[float]] = {}
+        for ltag in order:
+            if ltag in matched:
+                score, gtag = matched[ltag]
+                label_map[ltag] = gtag
+                log.info(
+                    "[5/7] speaker linking: %s -> %s (cos %.3f, %d file(s))",
+                    ltag,
+                    gtag,
+                    score,
+                    len(stored[gtag].get("files", [])),
+                )
+            else:
+                gtag = f"SPEAKER_{store['next_tag']:02d}"
+                while gtag in stored:  # never reuse a live tag
+                    store["next_tag"] += 1
+                    gtag = f"SPEAKER_{store['next_tag']:02d}"
+                store["next_tag"] += 1
+                label_map[ltag] = gtag
+                log.info("[5/7] speaker linking: %s -> %s (new voice)", ltag, gtag)
+
+            unit = local_unit[ltag]
+            if unit is None:
+                continue  # tagged but not enrolled
+            entry = stored.get(gtag)
+            if entry is None:
+                stored[gtag] = {
+                    "tag": gtag,
+                    "centroid": unit.tolist(),
+                    "n_embeddings": 1,
+                    "files": [source_name],
+                    "last_seen": _now_iso(),
+                }
+            else:
+                # Running mean of the unit centroids, weighted by how many
+                # enrollments each side already carries.
+                n = int(entry.get("n_embeddings", 1))
+                prev = _unit_centroid(entry["centroid"])
+                mean = unit + n * prev if prev is not None else unit * (n + 1)
+                norm = float(np.linalg.norm(mean))
+                if norm > 1e-9:
+                    mean = mean / norm
+                entry["centroid"] = mean.tolist()
+                entry["n_embeddings"] = n + 1
+                if source_name not in entry.get("files", []):
+                    entry.setdefault("files", []).append(source_name)
+                entry["last_seen"] = _now_iso()
+            embeddings_out[gtag] = stored[gtag]["centroid"]
+
+        store["speakers"] = list(stored.values())
+        _write_store(store)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    relabeled = [{**r, "speaker": label_map[r["speaker"]]} for r in rows]
+    return relabeled, embeddings_out
 
 
 # --------------------------------------------------------------------------- #
@@ -580,6 +816,7 @@ def run_pipeline(
     """
     timings: dict[str, float] = {}
     total_t0 = time.perf_counter()
+    input_name = Path(audio_path).name  # before it becomes converted.mp3 below
 
     ckpt: Optional[Checkpoint] = None
     if resume:
@@ -723,7 +960,16 @@ def run_pipeline(
         if not need_diarize:
             log.info("[5/7] cache hit: diarization")
             with _timed(timings, "diarize"):
-                rows = ckpt.load_json(_CKPT_DIARIZE)
+                payload = ckpt.load_json(_CKPT_DIARIZE)
+                if isinstance(payload, dict):
+                    rows = payload["turns"]
+                else:
+                    # Legacy bare-list checkpoint from before speaker linking:
+                    # already labeled, and no centroids to relink against.
+                    log.info(
+                        "[5/7] legacy diarize.json (pre-linking); keeping stored labels"
+                    )
+                    rows = payload
                 diarize_segments = pd.DataFrame(
                     rows, columns=["start", "end", "speaker"]
                 )
@@ -731,15 +977,33 @@ def run_pipeline(
             if diarize_future is not None:
                 # Join the parallel diarization; re-raises any worker error
                 # here, after the ASR/alignment checkpoints were saved above.
-                diarize_segments, elapsed = diarize_future.result()
+                diarize_segments, centroids, elapsed = diarize_future.result()
                 timings["diarize"] = round(elapsed, 3)
             else:
                 with _timed(timings, "diarize"):
-                    diarize_segments, _ = _run_diarization(
+                    diarize_segments, centroids, _ = _run_diarization(
                         audio, min_speakers, max_speakers
                     )
+            rows = _diarize_rows(diarize_segments)
+            embeddings_out: dict[str, list[float]] = {}
+            if SPEAKER_LINKING:
+                if centroids:
+                    link_t0 = time.perf_counter()
+                    rows, embeddings_out = _link_speakers(rows, centroids, input_name)
+                    log.info(
+                        "[5/7] speaker linking done in %.2fs",
+                        time.perf_counter() - link_t0,
+                    )
+                else:
+                    log.info(
+                        "[5/7] speaker linking skipped: no speaker centroids returned"
+                    )
+            payload: dict = {"turns": rows}
+            if SPEAKER_LINKING:
+                payload["embeddings"] = embeddings_out
             if ckpt:
-                ckpt.save_json(_CKPT_DIARIZE, _diarize_rows(diarize_segments))
+                ckpt.save_json(_CKPT_DIARIZE, payload)
+            diarize_segments = pd.DataFrame(rows, columns=["start", "end", "speaker"])
 
         # 6. assign speakers ----------------------------------------------- #
         log.info("[6/7] assigning speakers to segments")

@@ -25,7 +25,7 @@ The engine (`run_pipeline`) runs one model at a time on the critical path, freei
 2. **`[2/7]` Transcribe** — load `large-v3-turbo` and transcribe. On Apple Silicon the default backend is **MLX whisper on the Apple GPU** (fp16), with the audio first split into speech chunks by whisperx's own VAD; faster-whisper/CTranslate2 (CPU) is the fallback backend (`ASR_BACKEND`).
 3. **`[3/7]` Free ASR** — drop the model, reclaim memory (CT2 backend; the MLX model stays cached in-process).
 4. **`[4/7]` Align** — load the alignment model, refine word timestamps, free it. (Skipped gracefully on unsupported languages.)
-5. **`[5/7]` Diarize** — load the WhisperX diarization pipeline using `HF_TOKEN`, detect speakers, free it (runs in parallel with 2–4 when both halves need computing).
+5. **`[5/7]` Diarize** — load the WhisperX diarization pipeline using `HF_TOKEN`, detect speakers, free it (runs in parallel with 2–4 when both halves need computing). Known voices are then linked to their stable cross-file tags (see "Speaker memory" below).
 6. **`[6/7]` Assign speakers** — map speakers onto segments.
 7. **`[7/7]` Build script** — emit a list of `{ "time": { "start", "end" }, "speaker", "text" }`.
 
@@ -74,6 +74,9 @@ Config (`.env`):
 - `ASR_DEVICE=cpu` / `ASR_THREADS` / `COMPUTE_TYPE=int8` — ct2 backend only.
 - `PARALLEL_STAGES=auto` — run diarization alongside ASR+alignment
   (`true`/`false` force; `auto` = on with the mlx backend).
+- `SPEAKER_LINKING=true` — link voices to stable speaker tags across files
+  (see "Speaker memory" below); `SPEAKER_LINK_THRESHOLD` tunes the match
+  cutoff.
 
 Measured warm and back-to-back on a base M2 (4 P-cores, 16 GB): a 10-minute
 WebEx recording runs the full pipeline in ~115s (~5× real-time); the same clip
@@ -100,6 +103,36 @@ uv run python3 benchmarks/bench_transcribe.py --devices mps cpu
 > super-linearly on CPU, so the gap only opens at scale. Use a 600s+ clip (or
 > the full file) to see the real speedup.
 
+## Speaker memory (stable speaker tags)
+
+Diarization labels every file in isolation, so the same person used to get a
+different `SPEAKER_XX` tag in each recording. With speaker linking on
+(default), the pipeline also asks diarization for the per-speaker voice
+embeddings it already computes internally (wespeaker, 256-dim — no extra
+inference) and keeps one centroid per voice in a small on-disk store
+(`.speakers.json`, gitignored):
+
+- a voice seen before keeps **the same tag in every file**;
+- a new voice takes the **next unused tag** (`SPEAKER_00`, `SPEAKER_01`, …)
+  in order of first appearance;
+- tags are deliberately anonymous — stable identity, never names.
+
+Matching is cosine similarity between unit centroids above a threshold
+(`SPEAKER_LINK_THRESHOLD`, default 0.70, calibrated on two recordings with the
+same speaker pair — numbers in `OPTIMIZATION_LOG.md`), biased high on purpose:
+a missed match only costs one extra tag, a false merge would corrupt two
+identities. The store is read and written under a file lock and replaced
+atomically, so CLI and server jobs can run concurrently.
+
+- Reset the namespace: delete `.speakers.json`.
+- Disable (per-file labels, as before): `SPEAKER_LINKING=false`.
+- Relocate the store: `SPEAKER_STORE=/path/to/speakers.json`.
+
+> Adding `speaker_linking` to the cache key one-time-invalidates existing
+> checkpoints (the same one-time cost the ASR-backend switch had). A cached
+> `script.json` always returns the tags it was written with — a tag never
+> changes which voice it means.
+
 ## Resume & checkpointing
 
 A run can fail at any of the seven steps (OOM, a gated-model 401, …). To avoid
@@ -115,7 +148,7 @@ Per-job folder (`.transcribe_cache/<digest>/`):
 | `converted.mp3` | 1     | the normalized 16 kHz mono audio                     |
 | `asr.json`      | 2     | raw ASR result (the expensive one)                   |
 | `aligned.json`  | 4     | word-aligned result                                  |
-| `diarize.json`  | 5     | speaker turns as `[{start, end, speaker}, …]`     |
+| `diarize.json`  | 5     | `{"turns": [{start, end, speaker}, …], "embeddings": {tag: centroid}}` (embeddings half present with speaker linking) |
 | `final.json`    | 6     | result after speaker assignment                      |
 | `script.json`   | 7     | the final clean script (a hit here = instant return) |
 | `meta.json`     | —    | content hash, params, status, timings                |
@@ -127,7 +160,7 @@ Cache-hit stages are logged (`[5/7] cache hit: diarization`). The cache key
 excludes `batch_size` (it doesn't change the output), so tweaking it for memory
 won't bust the cache. It **does** include model name, ASR backend, the per-stage
 devices (`asr_device`, `pipeline_device`), compute type, thread count, language,
-speaker bounds, and the diarization model.
+speaker bounds, the diarization model, and speaker linking.
 
 - CLI: `--no-resume` ignores the cache and runs the full pipeline.
 - HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
@@ -175,6 +208,7 @@ ASR_DEVICE=cpu                # ct2 backend only (faster-whisper has no MPS)
 ASR_THREADS=8                 # ct2 backend only
 COMPUTE_TYPE=int8             # ct2 backend only
 PARALLEL_STAGES=auto          # diarization ∥ ASR+alignment (true | false | auto)
+SPEAKER_LINKING=true          # stable speaker tags across files (delete .speakers.json to reset)
 BATCH_SIZE=8                  # ct2 backend only; smaller = less memory
 HOST=0.0.0.0
 PORT=8000

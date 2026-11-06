@@ -144,6 +144,10 @@ def run_pipeline(snippet: Path, device: str, out_dir: Path) -> RunResult:
     env = dict(os.environ)
     env["DEVICE"] = device  # PIPELINE_DEVICE for the PyTorch stages
     env["RESUME"] = "false"  # force a full fresh run each time
+    # Keep the speaker store out of benchmark runs: snippets are cuts of the
+    # baseline file, so linking them would re-tag their voices with global
+    # tags and make the report's speaker column incomparable.
+    env["SPEAKER_LINKING"] = "false"
 
     py = sys.executable
     cmd = [
