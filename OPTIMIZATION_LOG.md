@@ -120,3 +120,34 @@ speaker VAD), Diart, SSND. Conclusions:
      CLI/API contract; latency-to-first-word is not a current requirement.
 - **Do NOT** transcribe separated streams (artifacts hurt WER; the mixture
   stays the ASR input).
+
+## 2026-11-06 — overlap probe (sizing the separation prize)
+
+User constraint confirmed: input is ALWAYS a single mixed audio file — capture-
+level separation (WebEx per-track recording) is moot. So separation, if it
+happens, must happen in-pipeline.
+
+Probed overlap share by running community-1's segmentation head directly
+(`pipe._segmentation` → non-aggregated Inference output, shape
+(W, 589, 3) = 10s windows, 1.0s step, 3 local-speaker channels; manual
+overlap-add aggregation, threshold 0.5, "overlap" = mean expected active
+speakers ≥ 1.5). Throwaway script, not shipped:
+
+- s3-and-research.opus (1718s): speech 89.9%, overlap **7.2% of speech time**
+  (6.5% of file), peak 2 simultaneous.
+- ask-redesign-p1.opus (835s): speech 75.6%, overlap **0.36% of speech time**,
+  peak 2.
+
+Read: the overlap prize is real but modest and HIGHLY file-dependent (20×
+between our two files; never >2 simultaneous talkers locally). Separation is a
+marginal quality play — at most ~7% of speech time on chatty calls, ~0% on
+disciplined ones — not a wall-clock play. Verdict: keep the eval gate (only
+worth integrating if a separator beats pyannote DER in overlap regions and
+costs nothing on the critical path); **enrollment (stable cross-file speaker
+names) moves up as the highest-certainty win** — it helps every file
+regardless of overlap.
+
+Bonus internals: community-1 segmentation = 10s windows / 1.0s hop / 3 local
+speakers; direct `pyannote/segmentation-3.0` load 401s on our token (conditions
+not accepted for that repo — the community-1 sub-model works, no extra click
+needed).
