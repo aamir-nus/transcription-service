@@ -135,7 +135,7 @@ def run_pipeline(snippet: Path, device: str, out_dir: Path) -> RunResult:
     `device` is the PIPELINE_DEVICE for align/diarize ('mps' or 'cpu'); ASR is
     always CPU (faster-whisper has no MPS backend).
     """
-    label = f"{snippet.stem} @ {device}"
+    label = f"{snippet.stem} @ {device} +asr:{os.getenv('ASR_BACKEND', 'auto')}"
     out_vtt = out_dir / f"{snippet.stem}.{device}.vtt"
     res = RunResult(
         label=label, audio_seconds=audio_duration(snippet), vtt_path=out_vtt

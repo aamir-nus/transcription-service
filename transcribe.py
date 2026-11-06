@@ -99,14 +99,53 @@ def _resolve_device(preferred: Optional[str]) -> str:
 # PyTorch stages (align + diarize): MPS when available. Default 'auto' picks the
 # best accelerator; set DEVICE=cpu to force the old slow path for debugging.
 PIPELINE_DEVICE: str = _resolve_device(os.getenv("DEVICE", "auto"))
-# ASR stage: faster-whisper/CTranslate2 -- CPU only (no MPS backend exists).
-# Override with ASR_DEVICE only if you have a faster-whisper build that supports
-# another device; otherwise leave as 'cpu'.
+# ASR stage: two interchangeable backends.
+#   'mlx' -> MLX whisper on the Apple GPU (Metal, fp16) -- several times faster
+#            than CPU int8 on Apple Silicon, same model weights.
+#   'ct2' -> faster-whisper/CTranslate2 (ASR_DEVICE, COMPUTE_TYPE, ASR_THREADS).
+# 'auto' prefers MLX when the package is importable and the configured model has
+# a known MLX conversion; otherwise it falls back to ct2.
+ASR_BACKEND: str = (os.getenv("ASR_BACKEND") or "auto").lower()
 ASR_DEVICE: str = (os.getenv("ASR_DEVICE") or "cpu").lower()
-# faster-whisper CPU thread count. whisperx defaults to 4, which leaves half the
-# cores idle on Apple Silicon (8 cores) -- a real ASR bottleneck. Default to all
-# logical cores.
+# faster-whisper CPU thread count (ct2 backend only). whisperx defaults to 4,
+# which leaves cores idle; default to all logical cores.
 ASR_THREADS: int = int(os.getenv("ASR_THREADS", str(max(1, os.cpu_count() or 4))))
+# Optional explicit MLX repo id (default: mapped from TRANSCRIPTION_MODEL below).
+MLX_MODEL: Optional[str] = os.getenv("MLX_MODEL") or None
+
+# Known MLX (mlx-community) conversions of the whisperx model names. An
+# unmapped TRANSCRIPTION_MODEL with no MLX_MODEL override makes 'auto' fall
+# back to ct2 rather than guess at a conversion.
+_MLX_MODEL_REPOS = {
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "tiny": "mlx-community/whisper-tiny",
+}
+
+
+def _mlx_model_repo() -> Optional[str]:
+    """MLX repo id for the configured model, or None if there is no known one."""
+    if MLX_MODEL:
+        return MLX_MODEL
+    return _MLX_MODEL_REPOS.get(MODEL_NAME.lower())
+
+
+def _effective_asr_backend() -> str:
+    """Resolve ASR_BACKEND ('auto' -> 'mlx' when usable, else 'ct2')."""
+    if ASR_BACKEND in {"mlx", "ct2"}:
+        return ASR_BACKEND
+    try:
+        import mlx_whisper  # noqa: F401
+
+        return "mlx" if _mlx_model_repo() else "ct2"
+    except ImportError:
+        return "ct2"
+
+
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
 
@@ -247,6 +286,7 @@ def _cache_params(
     """
     return {
         "model": MODEL_NAME,
+        "asr_backend": _effective_asr_backend(),
         "asr_device": ASR_DEVICE,
         "pipeline_device": PIPELINE_DEVICE,
         "compute_type": COMPUTE_TYPE,
@@ -358,6 +398,90 @@ class Checkpoint:
 
 
 # --------------------------------------------------------------------------- #
+# ASR backends
+# --------------------------------------------------------------------------- #
+def _transcribe_asr_mlx(audio: "np.ndarray", language: Optional[str]) -> dict:
+    """Transcribe with MLX whisper on the Apple GPU (Metal, fp16), VAD-chunked.
+
+    Same model weights as the ct2 path (mlx-community conversions of the
+    OpenAI checkpoints) but the encoder/decoder matmuls run on the GPU, which
+    is several times faster than CTranslate2 int8 on this class of CPU.
+
+    The audio is first split into speech chunks with whisperx's own Pyannote
+    VAD -- the exact chunker the ct2 backend uses -- and each chunk is
+    transcribed independently. This is not optional: whisper's fixed 30s
+    windowing over unchunked audio skips over speech (seek jumps) and
+    repetition-loops on long context (a known turbo artifact), which the VAD
+    chunking avoids. A bonus: each chunk starts with fresh context, so the
+    greedy decode cannot inherit a loop from previous windows.
+
+    Word timestamps come from the alignment stage as before, so only
+    start/end/text are kept per segment.
+    """
+    import mlx_whisper
+    from whisperx.audio import SAMPLE_RATE
+    from whisperx.vads import Pyannote
+
+    repo = _mlx_model_repo()
+    if not repo:
+        raise RuntimeError(
+            f"no MLX conversion known for TRANSCRIPTION_MODEL={MODEL_NAME!r}; "
+            "set MLX_MODEL or ASR_BACKEND=ct2."
+        )
+    log.info(
+        "[2/7] transcribing with MLX whisper (%s, fp16, VAD-chunked, language=%s)",
+        repo,
+        language or "auto-detect",
+    )
+
+    vad_t0 = time.perf_counter()
+    vad = Pyannote(
+        torch.device(PIPELINE_DEVICE),
+        token=None,
+        chunk_size=30,
+        vad_onset=0.5,
+        vad_offset=0.363,
+    )
+    vad_out = vad(
+        {"waveform": Pyannote.preprocess_audio(audio), "sample_rate": SAMPLE_RATE}
+    )
+    chunks = Pyannote.merge_chunks(vad_out, chunk_size=30)
+    log.info(
+        "[2/7] VAD split audio into %d speech chunks (%.1fs)",
+        len(chunks),
+        time.perf_counter() - vad_t0,
+    )
+    if not chunks:
+        return {
+            "segments": [],
+            "word_timestamps": [],
+            "language": language or "en",
+        }
+
+    segments: list[dict] = []
+    detected: Optional[str] = language
+    for ch in chunks:
+        s0, s1 = ch["start"], ch["end"]
+        piece = audio[int(s0 * SAMPLE_RATE) : int(s1 * SAMPLE_RATE)]
+        r = mlx_whisper.transcribe(piece, path_or_hf_repo=repo, language=detected)
+        if detected is None and r.get("language"):
+            detected = r["language"]  # lock in detection from the first chunk
+        for seg in r.get("segments", []):
+            segments.append(
+                {
+                    "start": s0 + float(seg["start"]),
+                    "end": s0 + float(seg["end"]),
+                    "text": seg["text"],
+                }
+            )
+    return {
+        "segments": segments,
+        "word_timestamps": [],
+        "language": detected or "en",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline engine core (sequential, blocking)
 # --------------------------------------------------------------------------- #
 def run_pipeline(
@@ -438,29 +562,36 @@ def run_pipeline(
                 result = ckpt.load_json(_CKPT_ASR)
         else:
             with _timed(timings, "asr"):
-                log.info(
-                    "[2/7] loading ASR model %s on %s (compute_type=%s, threads=%d)",
-                    MODEL_NAME,
-                    ASR_DEVICE,
-                    COMPUTE_TYPE,
-                    ASR_THREADS,
-                )
-                model = whisperx.load_model(
-                    MODEL_NAME,
-                    ASR_DEVICE,
-                    compute_type=COMPUTE_TYPE,
-                    threads=ASR_THREADS,
-                    use_auth_token=HF_TOKEN,
-                )
                 log.info("[2/7] loading audio: %s", audio_path)
                 audio = whisperx.load_audio(audio_path)
-                log.info("[2/7] transcribing (batch_size=%d)", batch_size)
-                result = model.transcribe(
-                    audio, batch_size=batch_size, language=language
-                )
-                # 3. free ASR model before touching alignment ----------------- #
-                log.info("[3/7] releasing ASR model")
-                release_model(model)
+                if _effective_asr_backend() == "mlx":
+                    result = _transcribe_asr_mlx(audio, language)
+                    # MLX caches the model in-process (ModelHolder); nothing to
+                    # free between runs, and the next stage owns the GPU anyway.
+                    log.info("[3/7] MLX model stays cached in-process")
+                else:
+                    log.info(
+                        "[2/7] loading ASR model %s on %s "
+                        "(compute_type=%s, threads=%d)",
+                        MODEL_NAME,
+                        ASR_DEVICE,
+                        COMPUTE_TYPE,
+                        ASR_THREADS,
+                    )
+                    model = whisperx.load_model(
+                        MODEL_NAME,
+                        ASR_DEVICE,
+                        compute_type=COMPUTE_TYPE,
+                        threads=ASR_THREADS,
+                        use_auth_token=HF_TOKEN,
+                    )
+                    log.info("[2/7] transcribing (batch_size=%d)", batch_size)
+                    result = model.transcribe(
+                        audio, batch_size=batch_size, language=language
+                    )
+                    # 3. free ASR model before touching alignment ------------- #
+                    log.info("[3/7] releasing ASR model")
+                    release_model(model)
             if ckpt:
                 ckpt.save_json(_CKPT_ASR, result)
 
