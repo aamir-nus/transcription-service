@@ -43,7 +43,7 @@ biggest performance lever on Apple Silicon:
 
 | stage    | backend | why                                                                     |
 | -------- | ------- | ----------------------------------------------------------------------- |
-| ASR      | MLX     | whisper on the **Apple GPU** (Metal, fp16) — ~5× faster than CPU int8   |
+| ASR      | MLX     | whisper on the **Apple GPU** (Metal, fp16) — ~3× faster than CPU int8   |
 | Align    | `mps`   | wav2vec2 (PyTorch) — MPS is faster                                      |
 | Diarize  | `mps`   | pyannote (PyTorch) — **MPS is ~8× faster** than CPU here                |
 
@@ -55,9 +55,10 @@ ASR has two interchangeable backends, selected by `ASR_BACKEND`:
   backend uses — because whisper's fixed 30s windowing over unchunked audio
   skips speech and repetition-loops (a known turbo artifact).
 - **`ct2`**: faster-whisper/CTranslate2 on CPU (`ASR_DEVICE`, `COMPUTE_TYPE`,
-  `ASR_THREADS`). CTranslate2 has no MPS backend and is memory-bandwidth-bound
-  at `int8` — on a 4-performance-core Apple Silicon chip it runs slower than
-  real-time, which is why MLX is the default.
+  `ASR_THREADS`). CTranslate2 has no MPS backend; at `int8` it is
+  memory-bandwidth-bound, ~3× slower than MLX on long files — and its CPU
+  speed swings several-fold with machine state (cold caches, thermal/power
+  throttling), so only compare benchmarks run back-to-back.
 
 Since all three heavy stages share the one GPU, diarization runs in parallel
 with ASR+alignment (`PARALLEL_STAGES`, default on with the mlx backend); each
@@ -74,9 +75,10 @@ Config (`.env`):
 - `PARALLEL_STAGES=auto` — run diarization alongside ASR+alignment
   (`true`/`false` force; `auto` = on with the mlx backend).
 
-Measured on a base M2 (4 P-cores, 16 GB): a 10-minute WebEx recording runs the
-full pipeline in ~115s (~5× real-time); the same file on the pre-MLX stack took
-~5× longer. Short clips are dominated by model-load time (~3–4s total).
+Measured warm and back-to-back on a base M2 (4 P-cores, 16 GB): a 10-minute
+WebEx recording runs the full pipeline in ~115s (~5× real-time); the same clip
+on the ct2-only stack takes ~217s (~1.9× slower). Short clips are dominated by
+model-load time (~3–4s total), so the gap there is smaller (~1.8×).
 
 ### Benchmarking short clips
 
