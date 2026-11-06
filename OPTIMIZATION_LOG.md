@@ -151,3 +151,16 @@ Bonus internals: community-1 segmentation = 10s windows / 1.0s hop / 3 local
 speakers; direct `pyannote/segmentation-3.0` load 401s on our token (conditions
 not accepted for that repo — the community-1 sub-model works, no extra click
 needed).
+
+## 2026-11-06 — design decision: stable tags (not names); P(inf) future note
+
+- Enrollment will use **stable tags across files** (SPEAKER_00, SPEAKER_01, …
+  in order of first-ever appearance), not named entities. Names are diverse
+  across the board (south asian, nordic, spanish, irish, …) — auto-naming is
+  inappropriate at this stage. Stable tags are repeatable and give future
+  improvements a deterministic check-layer to build on top of.
+- **P(inf) — lowest priority "coolness factor", do NOT chase now**: a
+  native-audio multimodal LLM (Gemma-3n-12B-style: understands audio signals
+  directly, no encoder→text input mapping) that identifies repeated audio
+  signals and does anaphora/entity resolution to map speaker tags to entities.
+  Strictly future scope; recorded so it isn't lost.
