@@ -31,6 +31,7 @@ import tempfile
 import time
 import uuid
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -160,6 +161,11 @@ DEFAULT_OUTPUT_FORMAT: str = os.getenv("DEFAULT_OUTPUT_FORMAT", "md")
 RESUME: bool = os.getenv("RESUME", "true").lower() in {"1", "true", "yes", "on"}
 CHECKPOINT_DIR: Path = Path(os.getenv("CHECKPOINT_DIR", ".transcribe_cache"))
 DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
+# Run diarization on a worker thread alongside ASR+alignment when both halves
+# need computing: diarization depends only on the audio, so the branches are
+# independent. 'auto' enables it with the mlx backend (MLX and MPS share the
+# one GPU but interleave well); 'true'/'false' force it on/off.
+PARALLEL_STAGES: str = (os.getenv("PARALLEL_STAGES") or "auto").lower()
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -482,6 +488,65 @@ def _transcribe_asr_mlx(audio: "np.ndarray", language: Optional[str]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Diarization (shared by the sequential and parallel paths)
+# --------------------------------------------------------------------------- #
+def _parallel_diarize_enabled() -> bool:
+    """Resolve PARALLEL_STAGES ('auto' -> on with the mlx backend)."""
+    if PARALLEL_STAGES in {"1", "true", "yes", "on"}:
+        return True
+    if PARALLEL_STAGES in {"0", "false", "no", "off"}:
+        return False
+    return _effective_asr_backend() == "mlx"
+
+
+# Single worker so concurrent API jobs never stack diarizations (one GPU).
+_DIARIZE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diarize")
+
+
+def _diarize_rows(diarize_segments: "pd.DataFrame") -> list[dict]:
+    """Checkpointable rows from a diarization result frame."""
+    return [
+        {
+            "start": float(r["start"]),
+            "end": float(r["end"]),
+            "speaker": str(r["speaker"]),
+        }
+        for _, r in diarize_segments[["start", "end", "speaker"]].iterrows()
+    ]
+
+
+def _run_diarization(
+    audio: "np.ndarray",
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+) -> tuple["pd.DataFrame", float]:
+    """Load the diarization pipeline, diarize ``audio``, free it.
+
+    Returns ``(segments frame, elapsed seconds)``. Runs on the main thread or
+    on the diarize worker; it must not touch the Checkpoint (meta.json races
+    with the main thread) -- the caller persists the result after joining.
+    """
+    t0 = time.perf_counter()
+    if not HF_TOKEN:
+        raise RuntimeError(
+            "HF_TOKEN is not set. The diarization model is gated; set HF_TOKEN in .env."
+        )
+    log.info("[5/7] running diarization (device=%s)", PIPELINE_DEVICE)
+    diarize_kwargs: dict = {"token": HF_TOKEN, "device": PIPELINE_DEVICE}
+    if DIARIZE_MODEL:
+        diarize_kwargs["model_name"] = DIARIZE_MODEL
+    diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
+    try:
+        segments = diarize_pipeline(
+            audio, min_speakers=min_speakers, max_speakers=max_speakers
+        )
+    finally:
+        log.info("[5/7] releasing diarization pipeline")
+        release_model(diarize_pipeline)
+    return segments, time.perf_counter() - t0
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline engine core (sequential, blocking)
 # --------------------------------------------------------------------------- #
 def run_pipeline(
@@ -495,7 +560,10 @@ def run_pipeline(
 ) -> list[dict]:
     """Transcribe ``audio_path`` end-to-end and return a clean speaker script.
 
-    Stages run strictly one at a time, each model freed before the next loads:
+    Stages run one model at a time on the critical path (each freed before the
+    next loads), with one structural exception: diarization depends only on the
+    audio, so when ASR/alignment also need computing it runs concurrently on a
+    worker thread and is joined before speaker assignment (PARALLEL_STAGES):
 
       1. convert the input to a normalized mp3 (ffmpeg)
       2. load ASR model (``MODEL_NAME``) -> load audio -> transcribe (small batch)
@@ -555,15 +623,33 @@ def run_pipeline(
                 )
         audio_path = str(converted_mp3)
 
+        # What still needs computing? (a cache hit skips that stage.)
+        need_asr = not (ckpt and ckpt.has(_CKPT_ASR))
+        need_aligned = not (ckpt and ckpt.has(_CKPT_ALIGNED))
+        need_diarize = not (ckpt and ckpt.has(_CKPT_DIARIZE))
+
+        # ASR, alignment and diarization all consume the same 16 kHz waveform;
+        # load it once up front.
+        if need_asr or need_aligned or need_diarize:
+            audio = whisperx.load_audio(audio_path)
+
+        # Diarization depends only on the audio, not on the ASR result -- when
+        # the other heavy half also needs computing, run it on a worker thread
+        # in parallel and join before speaker assignment.
+        diarize_future = None
+        if need_diarize and (need_asr or need_aligned) and _parallel_diarize_enabled():
+            log.info("[5/7] diarization running in parallel with ASR/alignment")
+            diarize_future = _DIARIZE_POOL.submit(
+                _run_diarization, audio, min_speakers, max_speakers
+            )
+
         # 2. ASR ----------------------------------------------------------- #
-        if ckpt and ckpt.has(_CKPT_ASR):
+        if not need_asr:
             log.info("[2/7] cache hit: ASR result")
             with _timed(timings, "asr"):
                 result = ckpt.load_json(_CKPT_ASR)
         else:
             with _timed(timings, "asr"):
-                log.info("[2/7] loading audio: %s", audio_path)
-                audio = whisperx.load_audio(audio_path)
                 if _effective_asr_backend() == "mlx":
                     result = _transcribe_asr_mlx(audio, language)
                     # MLX caches the model in-process (ModelHolder); nothing to
@@ -596,10 +682,6 @@ def run_pipeline(
                 ckpt.save_json(_CKPT_ASR, result)
 
         detected_language = result.get("language", language)
-
-        # align + diarize both need the audio array; load it if ASR was cached.
-        if audio is None:
-            audio = whisperx.load_audio(audio_path)
 
         # 4. alignment ----------------------------------------------------- #
         if ckpt and ckpt.has(_CKPT_ALIGNED):
@@ -638,7 +720,7 @@ def run_pipeline(
                 ckpt.save_json(_CKPT_ALIGNED, result)
 
         # 5. diarization --------------------------------------------------- #
-        if ckpt and ckpt.has(_CKPT_DIARIZE):
+        if not need_diarize:
             log.info("[5/7] cache hit: diarization")
             with _timed(timings, "diarize"):
                 rows = ckpt.load_json(_CKPT_DIARIZE)
@@ -646,32 +728,18 @@ def run_pipeline(
                     rows, columns=["start", "end", "speaker"]
                 )
         else:
-            with _timed(timings, "diarize"):
-                if not HF_TOKEN:
-                    raise RuntimeError(
-                        "HF_TOKEN is not set. The diarization model is gated; "
-                        "set HF_TOKEN in .env."
+            if diarize_future is not None:
+                # Join the parallel diarization; re-raises any worker error
+                # here, after the ASR/alignment checkpoints were saved above.
+                diarize_segments, elapsed = diarize_future.result()
+                timings["diarize"] = round(elapsed, 3)
+            else:
+                with _timed(timings, "diarize"):
+                    diarize_segments, _ = _run_diarization(
+                        audio, min_speakers, max_speakers
                     )
-                log.info("[5/7] running diarization (device=%s)", PIPELINE_DEVICE)
-                diarize_kwargs: dict = {"token": HF_TOKEN, "device": PIPELINE_DEVICE}
-                if DIARIZE_MODEL:
-                    diarize_kwargs["model_name"] = DIARIZE_MODEL
-                diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
-                diarize_segments = diarize_pipeline(
-                    audio, min_speakers=min_speakers, max_speakers=max_speakers
-                )
-                log.info("[5/7] releasing diarization pipeline")
-                release_model(diarize_pipeline)
             if ckpt:
-                rows = [
-                    {
-                        "start": float(r["start"]),
-                        "end": float(r["end"]),
-                        "speaker": str(r["speaker"]),
-                    }
-                    for _, r in diarize_segments[["start", "end", "speaker"]].iterrows()
-                ]
-                ckpt.save_json(_CKPT_DIARIZE, rows)
+                ckpt.save_json(_CKPT_DIARIZE, _diarize_rows(diarize_segments))
 
         # 6. assign speakers ----------------------------------------------- #
         log.info("[6/7] assigning speakers to segments")
