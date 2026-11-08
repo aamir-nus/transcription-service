@@ -224,22 +224,24 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 ### Speed — low-hanging fruit first
 
-- [ ] **A. MLX turbo 8-bit quant** — `MLX_MODEL=mlx-community/whisper-large-v3-turbo-8bit`,
+- [~] **A. MLX turbo 8-bit quant** — `MLX_MODEL=mlx-community/whisper-large-v3-turbo-8bit`,
   zero code, back-to-back bench + WER gate vs baseline. Expect ~1.1–1.3× asr.
-- [ ] **B. MPS high-watermark A/B** — `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`
+  → claude (2026-11-08)
+- [~] **B. MPS high-watermark A/B** — `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`
   for diarize+align; one bench. Attacks the 39s GPU contention tax on ASR.
+  → claude (2026-11-08)
 - [ ] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
   eval files (s3-and-research + ask-redesign-p1) vs ct2 baseline. Biggest
   single asr lever if quality holds; different model family = gate is the WER.
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
-- [ ] **D. Profile the MLX asr path**: GPU-busy fraction vs Python/runtime
+- [~] **D. Profile the MLX asr path**: GPU-busy fraction vs Python/runtime
   overhead (per-chunk mel+tokenizer+decode loop). py-spy / Instruments /
   time-to-first-token deltas. Decision rule: GPU-busy > ~80% → Python stack
   is saturated, runtime swap buys little; overhead-dominated → the cpp/rust
   track (E) has real headroom. asr solo RTF is 0.09 @600s — bound the ceiling
-  BEFORE building anything.
+  BEFORE building anything. → claude (2026-11-08)
 
 ### Speed — compiled-runtime track (only if D says overhead-bound, or A–C saturated)
 
