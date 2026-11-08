@@ -14,6 +14,10 @@ The early "~5×" claims were inflated by cold-cache morning runs.
 WER vs the cached CT2 baseline is the cross-backend quality metric — char
 similarity collapses when decoder styles differ (fillers/punctuation).
 
+**Working checklist** lives at the bottom of this file (the one living
+section — everything else stays append-only). Claim with `[~] → <who> (date)`
+before starting an item; see it for what's done, open, and taken.
+
 ## Machine (verified, not guessed)
 
 - Base Apple M2 (**not** Pro/Max): 4 P-cores + 4 E-cores, 16 GB unified memory,
@@ -197,3 +201,81 @@ never touches the store; sequential (`PARALLEL_STAGES=false`) and parallel
 diarize paths both link; 8-process enrollment hammer on a shared store →
 unique tags, second wave re-links every voice at cos 1.000, `next_tag` stable,
 store clean after 16 lock-guarded writes.
+
+## 2026-11-08 — working checklist (the one LIVING section of this log)
+
+Marker convention for parallel agents:
+
+- `[x]` done and verified (outcome entry exists above/below with numbers)
+- `[~]` **claimed / in progress** — append `→ <who> (date)` when you pick it up;
+  do not start an item someone else has claimed
+- `[ ]` open
+
+Everything else in this file stays append-only; this section is edited in
+place. When you complete an item, tick it AND append a dated outcome entry.
+
+### Shipped (verified — do not redo)
+
+- [x] MPS align + diarize (7.7× diarize, byte-identical output)
+- [x] MLX ASR backend, VAD-chunked (WER-gated; naive whole-file failed)
+- [x] Parallel diarization under PARALLEL_STAGES (~20% @600s)
+- [x] Speaker enrollment — stable cross-file tags (calibrated thr 0.70)
+- [x] Honest benchmarking protocol (back-to-back, same machine state)
+
+### Speed — low-hanging fruit first
+
+- [ ] **A. MLX turbo 8-bit quant** — `MLX_MODEL=mlx-community/whisper-large-v3-turbo-8bit`,
+  zero code, back-to-back bench + WER gate vs baseline. Expect ~1.1–1.3× asr.
+- [ ] **B. MPS high-watermark A/B** — `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`
+  for diarize+align; one bench. Attacks the 39s GPU contention tax on ASR.
+- [ ] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
+  eval files (s3-and-research + ask-redesign-p1) vs ct2 baseline. Biggest
+  single asr lever if quality holds; different model family = gate is the WER.
+
+### Speed — saturation probe (the gate before any runtime rewrite)
+
+- [ ] **D. Profile the MLX asr path**: GPU-busy fraction vs Python/runtime
+  overhead (per-chunk mel+tokenizer+decode loop). py-spy / Instruments /
+  time-to-first-token deltas. Decision rule: GPU-busy > ~80% → Python stack
+  is saturated, runtime swap buys little; overhead-dominated → the cpp/rust
+  track (E) has real headroom. asr solo RTF is 0.09 @600s — bound the ceiling
+  BEFORE building anything.
+
+### Speed — compiled-runtime track (only if D says overhead-bound, or A–C saturated)
+
+- [ ] **E1. whisper.cpp (GGML/Metal)** — same whisper family, C++ runtime,
+  quantized gguf weights, long-form + VAD. Quality gate ≈ quantization only.
+  The lowest-friction "compiled backend" A/B.
+- [ ] **E2. ONNX Runtime, CoreML/Metal EP** — C++ runtime, python bindings;
+  whisper ONNX exports exist. Medium toolchain cost.
+- [ ] **E3. whisperkit / CoreML on the Neural Engine** — ANE is idle today
+  (everything shares the GPU); would REDUCE contention rather than add to it.
+  Swift toolchain cost.
+- [ ] **E4. candle (Rust) / burn (Rust) whisper** — cleanest "rust backend"
+  story, least mature quant/Metal support; try after E1.
+  Gate for all of E: WER parity + back-to-back wall-clock + no heavy new
+  toolchain burden on users of this repo.
+
+### Speed — bounded/conditional (known ceilings, do not prioritize yet)
+
+- [ ] **F. Merge-cues-before-align** (~5–7% e2e) — output-visible granularity
+  change; needs explicit user OK.
+- [ ] **G. Faster/streaming diarizer** (pyannote streaming, Sortformer-class)
+  — graduates to TOP priority only if asr gets ~2× faster (diarize ~70s solo
+  @600s becomes the binder; floor with current diarizer ≈ 90s). Gate: DER in
+  overlap regions AND solo < 70s @600s.
+
+### Quality
+
+- [ ] **H. Hotwords / initial_prompt** for recurring product names + jargon —
+  zero speed cost, whisper-native; micro-test WER on jargon-dense spans.
+- [ ] **I. Overlap recovery / separation** — marginal by measurement (0.4–7.2%
+  of speech, file-dependent); stays behind the DER gate.
+- [ ] P(inf) native-audio entity linking — coolness factor only, do NOT chase.
+
+### Ceiling math every agent should know (600s clip, warm)
+
+Wall 113.5s = convert ~1.2 + asr 92.3 (contended; solo 53.1) + align 19.1 +
+ε; diarize ~70s solo, fully hidden. Even a 2× asr only lands ~85–95s wall
+because diarize becomes the binder. ASR backend work is capped at ~1.3× e2e
+until G is done; G is worth ~10% e2e even today (contention tax).
