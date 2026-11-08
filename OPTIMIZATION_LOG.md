@@ -281,3 +281,40 @@ Wall 113.5s = convert ~1.2 + asr 92.3 (contended; solo 53.1) + align 19.1 +
 ε; diarize ~70s solo, fully hidden. Even a 2× asr only lands ~85–95s wall
 because diarize becomes the binder. ASR backend work is capped at ~1.3× e2e
 until G is done; G is worth ~10% e2e even today (contention tax).
+
+## 2026-11-08 — A/B/D session 1: low-power trap, q4 data point, cache-key fix
+
+**Machine-state lesson (extends the house rule):** this session's batch ran
+with `lowpowermode 1` on battery — ALL GPU stages ~2.4× slower than the
+logged warm state (600s clip: asr 241.7s vs 92.3, diarize 236.7 vs ~70,
+total 274.8 vs 113.5; WER identical at 0.178 — pure throttle, no quality
+change). **Check `pmset -g | grep lowpower` + battery before every bench.**
+Timing numbers below from this session are low-power and NOT comparable to
+earlier entries; relative A/B within the batch is still tentatively valid.
+
+- **A (8-bit): blocked.** `mlx-community/whisper-large-v3-turbo-8bit` (and
+  `-4bit`, `-asr-*`) now ship the new `model.safetensors` layout; our
+  mlx-whisper 0.4.3 (PyPI latest!) only loads `weights.safetensors`/`npz` →
+  ValueError at load. Path to 8-bit: git-install mlx-extras' mlx_whisper —
+  deferred (unpinned dep in a user-facing repo) until quant upside is proven.
+- **A (q4 pivot): runs, quality plausible, not certified.**
+  `whisper-large-v3-turbo-q4` keeps the classic `weights.npz` layout. 600s:
+  WER vs ct2 baseline 0.225 (fp16-mlx is 0.178), **WER vs fp16-mlx output
+  0.136** (fp16-vs-ct2 is 0.178), coverage parity (same span, 482s vs 487s
+  cued speech, word counts within 2.4%), no skips/loops. Char-sim collapse
+  (0.101 vs baseline) is decoder-style drift, per this log's own warning.
+  Spot-read: q4 even fixed a name ("Amir" vs ct2's "Ameria"). Verdict:
+  acceptable as a SPEED experiment if the timing win is large; not adopted
+  without either 8-bit working or a ground-truth check. Timing pending
+  full-power re-run.
+- **Cache-key fix (committed 806ce25):** `MLX_MODEL` overrides now join the
+  cache key (as `mlx_model`), so a quantized repo never serves the fp16
+  run's cached transcripts. Default (no override) keys unchanged — no
+  invalidation for existing users.
+- **B (watermark): ran but invalid.** Under throttle: total 245.2 vs 274.8
+  (−11%), asr −13%, diarize −14% — suggestive, NOT trustworthy (throttled
+  state changes contention dynamics; run-to-run variance unmeasured). Redo
+  back-to-back at full power with a repeated control.
+- **D: not started** (deferred — profile at full power to be representative).
+
+Checklist markers: A/B/D stay `[~]` (claimed, in progress).
