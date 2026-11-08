@@ -224,12 +224,12 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 ### Speed — low-hanging fruit first
 
-- [~] **A. MLX turbo 8-bit quant** — `MLX_MODEL=mlx-community/whisper-large-v3-turbo-8bit`,
-  zero code, back-to-back bench + WER gate vs baseline. Expect ~1.1–1.3× asr.
-  → claude (2026-11-08)
-- [~] **B. MPS high-watermark A/B** — `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0`
-  for diarize+align; one bench. Attacks the 39s GPU contention tax on ASR.
-  → claude (2026-11-08)
+- [x] **A. MLX turbo quant** — REJECTED 2026-11-08 (see entry below): q4
+  showed NO speed gain (compute-bound, not memory-bound) + WER regression;
+  8-bit blocked by repo layout and moot for speed.
+- [x] **B. MPS high-watermark A/B** — REJECTED 2026-11-08: no effect at full
+  power (inside control spread on every stage); the throttled-state −11% was
+  a mirage.
 - [ ] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
   eval files (s3-and-research + ask-redesign-p1) vs ct2 baseline. Biggest
   single asr lever if quality holds; different model family = gate is the WER.
@@ -241,19 +241,21 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   time-to-first-token deltas. Decision rule: GPU-busy > ~80% → Python stack
   is saturated, runtime swap buys little; overhead-dominated → the cpp/rust
   track (E) has real headroom. asr solo RTF is 0.09 @600s — bound the ceiling
-  BEFORE building anything. → claude (2026-11-08)
+  BEFORE building anything. DONE 2026-11-08: ~85% GPU-bound → stack
+  saturated, E-track closed (see entry below).
 
-### Speed — compiled-runtime track (only if D says overhead-bound, or A–C saturated)
+### Speed — compiled-runtime track — CLOSED by D (GPU-bound; harness rewrite
+### ceiling ~5% e2e; revisit only bundled with an algorithm change)
 
-- [ ] **E1. whisper.cpp (GGML/Metal)** — same whisper family, C++ runtime,
+- [x] **E1. whisper.cpp (GGML/Metal)** — same whisper family, C++ runtime,
   quantized gguf weights, long-form + VAD. Quality gate ≈ quantization only.
   The lowest-friction "compiled backend" A/B.
-- [ ] **E2. ONNX Runtime, CoreML/Metal EP** — C++ runtime, python bindings;
+- [x] **E2. ONNX Runtime, CoreML/Metal EP** — C++ runtime, python bindings;
   whisper ONNX exports exist. Medium toolchain cost.
-- [ ] **E3. whisperkit / CoreML on the Neural Engine** — ANE is idle today
+- [x] **E3. whisperkit / CoreML on the Neural Engine** — ANE is idle today
   (everything shares the GPU); would REDUCE contention rather than add to it.
   Swift toolchain cost.
-- [ ] **E4. candle (Rust) / burn (Rust) whisper** — cleanest "rust backend"
+- [x] **E4. candle (Rust) / burn (Rust) whisper** — cleanest "rust backend"
   story, least mature quant/Metal support; try after E1.
   Gate for all of E: WER parity + back-to-back wall-clock + no heavy new
   toolchain burden on users of this repo.
@@ -318,3 +320,41 @@ earlier entries; relative A/B within the batch is still tentatively valid.
 - **D: not started** (deferred — profile at full power to be representative).
 
 Checklist markers: A/B/D stay `[~]` (claimed, in progress).
+
+## 2026-11-08 — A/B/D session 2 (full power, AC, lowpowermode 0): three closures
+
+Machine state verified before benching (`pmset -g`: AC attached, lowpowermode
+0). Controls reproduced the logged warm state (fp16: 117.1 / 111.5s vs logged
+113.5s; run-to-run spread ~5%).
+
+**B REJECTED — watermark is a no-op.** fp16 controls 117.1/111.5 vs wm0
+112.2 total; asr 96.6/90.9 vs 91.7; diarize 91.1/87.3 vs 87.9 — every stage
+inside the control spread. The −11% seen under Low Power Mode was a
+throttled-state artifact.
+
+**A REJECTED — quantization buys nothing on this chip.** q4 (turbo, npz
+layout): total 116.2 vs fp16 mean 114.3, asr 95.2 vs 93.8 — no gain, plus
+WER 0.226 vs 0.177 and q4-vs-fp16 disagreement 0.136. Read: turbo decode is
+**compute-bound, not memory-bound** on the base M2 → quant dequant overhead
+cancels bandwidth savings. Also closes 8-bit (already layout-blocked; now
+moot for speed).
+
+**D DONE — the Python stack is saturated.** cProfile on the sequential 600s
+run (asr solo 51.2s; cProfile overhead didn't move it → not python-bound).
+Decomposition of the 45.2s in mlx_whisper.transcribe:
+- `_main_loop` self 26.5s + KV-cache `apply` self 11.6s = **~84% native
+  MLX dispatch/eval** (MLX is lazy: forward frames only build the graph,
+  1.3s; GPU time lands where mx.eval forces it)
+- VAD chunking 3.4s (serial inside the asr stage); model load 0.5s; our
+  chunk loop ~0.02s
+→ GPU-busy ≈ 85-90% of asr. A cpp/rust harness rewrite (whisper.cpp,
+whisperkit, candle/burn) caps out at ~10-15% of asr ≈ **~5% end-to-end**.
+E-track CLOSED unless bundled with an algorithm change. Bonus: per-step
+KV-cache apply is ~25% of decode (4.3ms × 2690 steps) — an mlx-extras
+library inefficiency, upstream territory.
+
+**Where this leaves the checklist:** ASR speed on whisper-turbo is done —
+fp16 MLX is the shape of this model on this chip. Remaining levers: **C
+(parakeet TDT — algorithmic, fewer decode steps; WER-gated)** and **G
+(diarize/streaming — the binder once ASR improves, ~10% e2e even today via
+contention relief)**. Quality: H (hotwords) is cheap and untried.
