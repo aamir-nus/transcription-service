@@ -317,6 +317,10 @@ def _cache_params(
     """
     return {
         "model": MODEL_NAME,
+        # Explicit MLX repo overrides change the ASR output (e.g. a quantized
+        # conversion) but not MODEL_NAME -- scope the cache key to the actual
+        # repo so swapped models never serve each other's cached transcripts.
+        "mlx_model": MLX_MODEL,
         "asr_backend": _effective_asr_backend(),
         "asr_device": ASR_DEVICE,
         "pipeline_device": PIPELINE_DEVICE,
