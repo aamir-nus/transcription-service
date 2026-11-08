@@ -265,11 +265,11 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 - [ ] **F. Merge-cues-before-align** (~5–7% e2e) — output-visible granularity
   change; needs explicit user OK.
-- [~] **G. Faster/streaming diarizer** — now TOP speed priority (ASR proven
-  saturated; contention tax ~40s on asr; zero-diarize ceiling ≈ 73s vs 113.5
-  today). First probe: stage breakdown (segmentation vs embedding vs VBx),
-  then hop-doubling with the SAME model before any new dependency. Gate: DER
-  in overlap regions AND solo < 70s @600s. → claude (2026-11-08)
+- [x] **G. Faster/streaming diarizer** — SHIPPED 2026-11-08 (see entry below):
+  segmentation hop 2.0s (`DIARIZE_SEG_STEP`) → diarize 2.0× solo, e2e −22%
+  @600s, 100% final word-speaker agreement, linking intact. Remaining
+  follow-up: swap-in streaming/Sortformer diarizer only if the residual
+  ~20s contention tax ever matters.
 
 ### Quality
 
@@ -390,3 +390,57 @@ C (algorithm swap), E (compiled runtimes) all dead; fp16 MLX turbo is the
 ceiling for this chip. Remaining checklist levers: G (faster/streaming
 diarize — ~10% e2e via contention relief, binder once ASR improves) and
 H (hotwords quality). F (cue merge) needs user sign-off on output granularity.
+
+## 2026-11-08 — G SHIPPED: diarize hop 2.0s halves the stage, e2e −22% @600s, zero quality cost
+
+**Diagnosis first (why diarize cost ~48s solo / ~70-91s contended @600s).**
+Timing pyannote's internals via whisperx's progress hook on the 600s clip:
+segmentation 2.6s / **embeddings 45.2s (94%)** / VBx clustering 0.4s. The
+embedding stage runs one 10s crop per *local speaker* per *segmentation
+window*; at the default 1.0s hop (90% window overlap) that's ~590 windows ×
+~2 speakers ≈ 1180 crops ≈ **20× the audio duration**. The hop, not the
+model, was the cost.
+
+**The lever.** pyannote's `Inference` bakes `step` at `__init__` (setting
+`pipeline.segmentation_step` post-hoc is a silent no-op — verified), so the
+shipped code patches the built object: `diarize_pipeline.model._segmentation.step
+= DIARIZE_SEG_STEP` (default 2.0; 1.0 restores upstream exactly). Added to the
+cache key (`diarize_seg_step`) — one-time invalidation.
+
+**Solo hop A/B (600s clip, uncontended, same model):**
+
+| hop | diarize solo | turns | frame agreement vs 1.0 |
+| --- | --- | --- | --- |
+| 1.0 (upstream) | 48.2s | 219 | — |
+| 2.0 (shipped) | 24.1s | 229 | 98.35% |
+| 2.5 (rejected) | 20.9s | 217 | 97.25% |
+
+2.0 is the knee: 2.5 gives 13% more speed for 1.1pp agreement.
+
+**End-to-end bench (back-to-back, AC power, lowpowermode 0, 600s clip):**
+
+| | hop 2.0 | hop 1.0 | Δ |
+| --- | --- | --- | --- |
+| total | **92.7s** | 119.5s | **−22.4%** |
+| diarize (contended) | 48.1 | 91.4 | 1.90× |
+| asr (contended) | 72.1 | 96.9 | −26% (contention relief) |
+| WER | 0.177 | 0.178 | — |
+
+**Quality: the 1.6% raw-turn drift washes out completely.** Final VTT
+word-speaker agreement between the two runs: **100.00%** (225 cues each, every
+both-labeled 10ms frame identical) — assignment maps speakers per *word*, and
+the boundary shifts don't move a single word across a speaker change.
+
+**Speaker linking intact under hop 2.0** (centroids come from hop-2.0 crops
+now): fresh no-resume run of `aamir-minsuk-1on1-aug-20.opus` vs the
+hop-1.0-blended store — positives 0.942 / 0.957, negatives 0.475 / 0.532;
+correct one-to-one remap at threshold 0.70 with a wide margin. (Local tag
+order flipped vs the store under the new hop; linking fixed it — that's its
+job.)
+
+**Where this leaves the pie @600s:** wall 92.7s = convert 1.5 + asr 72.1
+contended (solo 53.1) + align 18.6 + ε. The residual contention tax is
+~19s. Next speed levers, in order: F (cue merge, needs user OK on output
+granularity, also −5-7%) and a streaming/Sortformer diarizer swap (new
+dependency; only worth it if the remaining tax matters). Quality: H
+(hotwords) still cheap and untried.

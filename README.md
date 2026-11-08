@@ -74,6 +74,11 @@ Config (`.env`):
 - `ASR_DEVICE=cpu` / `ASR_THREADS` / `COMPUTE_TYPE=int8` — ct2 backend only.
 - `PARALLEL_STAGES=auto` — run diarization alongside ASR+alignment
   (`true`/`false` force; `auto` = on with the mlx backend).
+- `DIARIZE_SEG_STEP=2.0` — segmentation window hop for diarization. The hop
+  decides how many overlapping 10s windows (and per-speaker embedding crops)
+  are processed: upstream's 1.0s costs ~2× the diarize time for ~1.6%
+  frame-level speaker differences on our eval audio; `1.0` restores upstream
+  behavior exactly.
 - `SPEAKER_LINKING=true` — link voices to stable speaker tags across files
   (see "Speaker memory" below); `SPEAKER_LINK_THRESHOLD` tunes the match
   cutoff.
@@ -160,7 +165,8 @@ Cache-hit stages are logged (`[5/7] cache hit: diarization`). The cache key
 excludes `batch_size` (it doesn't change the output), so tweaking it for memory
 won't bust the cache. It **does** include model name, ASR backend, the per-stage
 devices (`asr_device`, `pipeline_device`), compute type, thread count, language,
-speaker bounds, the diarization model, and speaker linking.
+speaker bounds, the diarization model, the segmentation hop
+(`diarize_seg_step`), and speaker linking.
 
 - CLI: `--no-resume` ignores the cache and runs the full pipeline.
 - HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
@@ -208,6 +214,7 @@ ASR_DEVICE=cpu                # ct2 backend only (faster-whisper has no MPS)
 ASR_THREADS=8                 # ct2 backend only
 COMPUTE_TYPE=int8             # ct2 backend only
 PARALLEL_STAGES=auto          # diarization ∥ ASR+alignment (true | false | auto)
+DIARIZE_SEG_STEP=2.0          # diarization window hop in s; 1.0 = upstream behavior
 SPEAKER_LINKING=true          # stable speaker tags across files (delete .speakers.json to reset)
 BATCH_SIZE=8                  # ct2 backend only; smaller = less memory
 HOST=0.0.0.0

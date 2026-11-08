@@ -163,6 +163,12 @@ DEFAULT_OUTPUT_FORMAT: str = os.getenv("DEFAULT_OUTPUT_FORMAT", "md")
 RESUME: bool = os.getenv("RESUME", "true").lower() in {"1", "true", "yes", "on"}
 CHECKPOINT_DIR: Path = Path(os.getenv("CHECKPOINT_DIR", ".transcribe_cache"))
 DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
+# Segmentation window hop in seconds (default 2.0). The hop controls how many
+# overlapping 10s windows (and therefore per-speaker embedding crops) the
+# diarizer processes: the default upstream 1.0s hop costs 2x the wall-clock
+# for ~1.6% frame-level speaker changes on our eval audio. 1.0 restores
+# upstream behavior exactly; see OPTIMIZATION_LOG.md.
+DIARIZE_SEG_STEP: float = float(os.getenv("DIARIZE_SEG_STEP", "2.0"))
 # Run diarization on a worker thread alongside ASR+alignment when both halves
 # need computing: diarization depends only on the audio, so the branches are
 # independent. 'auto' enables it with the mlx backend (MLX and MPS share the
@@ -327,6 +333,8 @@ def _cache_params(
         "compute_type": COMPUTE_TYPE,
         "threads": ASR_THREADS,
         "diarize_model": DIARIZE_MODEL or "default",
+        # Changes diarize output (turn boundaries) -> must scope the cache.
+        "diarize_seg_step": DIARIZE_SEG_STEP,
         "language": language,  # None == auto-detect
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
@@ -569,6 +577,14 @@ def _run_diarization(
     if DIARIZE_MODEL:
         diarize_kwargs["model_name"] = DIARIZE_MODEL
     diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
+    if DIARIZE_SEG_STEP > 0 and DIARIZE_SEG_STEP != 1.0:
+        # The embedding stage (94% of diarize wall-clock) runs one 10s crop per
+        # local speaker per segmentation window; the default 1.0s hop (90%
+        # window overlap) makes it process ~20x the audio duration. A 2.0s hop
+        # halves that for a 2x stage speedup with 98.4% frame-level agreement
+        # on our eval audio (see OPTIMIZATION_LOG.md). The Inference bakes its
+        # step at pipeline init, so patch the built object directly.
+        diarize_pipeline.model._segmentation.step = DIARIZE_SEG_STEP
     try:
         if SPEAKER_LINKING:
             segments, centroids = diarize_pipeline(
