@@ -265,10 +265,11 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 - [ ] **F. Merge-cues-before-align** (~5–7% e2e) — output-visible granularity
   change; needs explicit user OK.
-- [ ] **G. Faster/streaming diarizer** (pyannote streaming, Sortformer-class)
-  — graduates to TOP priority only if asr gets ~2× faster (diarize ~70s solo
-  @600s becomes the binder; floor with current diarizer ≈ 90s). Gate: DER in
-  overlap regions AND solo < 70s @600s.
+- [~] **G. Faster/streaming diarizer** — now TOP speed priority (ASR proven
+  saturated; contention tax ~40s on asr; zero-diarize ceiling ≈ 73s vs 113.5
+  today). First probe: stage breakdown (segmentation vs embedding vs VBx),
+  then hop-doubling with the SAME model before any new dependency. Gate: DER
+  in overlap regions AND solo < 70s @600s. → claude (2026-11-08)
 
 ### Quality
 
