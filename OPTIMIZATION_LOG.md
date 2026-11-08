@@ -230,9 +230,10 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 - [x] **B. MPS high-watermark A/B** — REJECTED 2026-11-08: no effect at full
   power (inside control spread on every stage); the throttled-state −11% was
   a mirage.
-- [ ] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
+- [~] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
   eval files (s3-and-research + ask-redesign-p1) vs ct2 baseline. Biggest
   single asr lever if quality holds; different model family = gate is the WER.
+  → claude (2026-11-08), reopened as a measured experiment per user
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
