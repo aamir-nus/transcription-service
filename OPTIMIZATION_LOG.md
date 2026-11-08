@@ -230,10 +230,10 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 - [x] **B. MPS high-watermark A/B** — REJECTED 2026-11-08: no effect at full
   power (inside control spread on every stage); the throttled-state −11% was
   a mirage.
-- [~] **C. Parakeet TDT v3 (mlx)** behind `ASR_BACKEND` — WER eval on BOTH
-  eval files (s3-and-research + ask-redesign-p1) vs ct2 baseline. Biggest
-  single asr lever if quality holds; different model family = gate is the WER.
-  → claude (2026-11-08), reopened as a measured experiment per user
+- [x] **C. Parakeet TDT v3 (mlx)** — REJECTED 2026-11-08 (see entry below):
+  2.6× faster than turbo-MLX but WER fails the gate on BOTH eval files
+  (0.294/0.241 vs turbo's 0.177/baseline-parity); beam-5 recovers neither
+  quality (0.290) nor speed (slower than turbo).
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
@@ -359,3 +359,33 @@ fp16 MLX is the shape of this model on this chip. Remaining levers: **C
 (parakeet TDT — algorithmic, fewer decode steps; WER-gated)** and **G
 (diarize/streaming — the binder once ASR improves, ~10% e2e even today via
 contention relief)**. Quality: H (hotwords) is cheap and untried.
+
+## 2026-11-08 — C REJECTED: parakeet-tdt-0.6b-v3 fails the WER gate on both files
+
+Spike via `parakeet-mlx 0.7.0` (pip-installed for the experiment; removed
+after), model `mlx-community/parakeet-tdt-0.6b-v3` bf16, driven through our
+exact VAD chunker (Pyannote, chunk_size=30), sequential/uncontended:
+
+- **Speed is real**: s3-600s asr solo 19.5–21.3s vs turbo-MLX 53.1s (**2.6×**);
+  ask-redesign-p1 (835s) 26.0s. Warm model load 0.8s.
+- **Quality fails, on both files**:
+  - s3-and-research-600s: WER vs ct2 baseline **0.294** (turbo-MLX 0.177).
+  - ask-redesign-p1 full file: WER **0.241** (turbo ≈ baseline parity here).
+  - Forensics: not just style drift (ITN "five percent" vs "5%" inflates the
+    number a little) — real dropped sentences ("do you want this to be in
+    english…"), garbles ("salary right okay it's really strictly confirmed" →
+    "summary. okay. actually, confirm"). It also fixes some turbo errors
+    ("glimps"→"glitch"), i.e. a different error profile, not a better one.
+- **Beam-5 doesn't rescue it**: WER 0.290 AND 62.6s — slower than turbo's
+  greedy. The gap is the model on accented WebEx meeting audio, not the
+  decoder.
+
+Quality is non-negotiable → C closed. The rejected-forever entry from
+2026-11-06 ("different model family → skip") was right for the wrong reason;
+now it's right for a measured one.
+
+**Consequence: the ASR speed story is COMPLETE.** A (quant), B (watermark),
+C (algorithm swap), E (compiled runtimes) all dead; fp16 MLX turbo is the
+ceiling for this chip. Remaining checklist levers: G (faster/streaming
+diarize — ~10% e2e via contention relief, binder once ASR improves) and
+H (hotwords quality). F (cue merge) needs user sign-off on output granularity.
