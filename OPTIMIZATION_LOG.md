@@ -234,6 +234,11 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   2.6× faster than turbo-MLX but WER fails the gate on BOTH eval files
   (0.294/0.241 vs turbo's 0.177/baseline-parity); beam-5 recovers neither
   quality (0.290) nor speed (slower than turbo).
+- [x] **C2. Canary-1b service-class spike** — REJECTED 2026-11-10 (see entry
+  below): canary-1b-flash 0.136, canary-1b-v2 0.156, parakeet-tdt-1.1b 0.144
+  vs turbo-MLX's 0.088 (same harness, same VAD chunks, same reference).
+  Leaderboard parity does not transfer to our accented WebEx audio at any
+  tested size; the transducer family is closed locally.
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
@@ -265,6 +270,10 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 - [ ] **F. Merge-cues-before-align** (~5–7% e2e) — output-visible granularity
   change; needs explicit user OK.
+- [ ] **J. Whisper-native word timestamps (drop the align stage)** — MLX
+  whisper's own DTW timestamps vs wav2vec2's; if accuracy holds, −20% wall
+  (align is 86s/hour uncontended). QUALITY-GATED on timestamp accuracy, not
+  WER. Cheap probe: compare word-time deltas on the 600s clip.
 - [x] **G. Faster/streaming diarizer** — SHIPPED 2026-11-08 (see entry below):
   segmentation hop 2.0s (`DIARIZE_SEG_STEP`) → diarize 2.0× solo, e2e −22%
   @600s, 100% final word-speaker agreement, linking intact. Remaining
@@ -279,12 +288,18 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   of speech, file-dependent); stays behind the DER gate.
 - [ ] P(inf) native-audio entity linking — coolness factor only, do NOT chase.
 
-### Ceiling math every agent should know (600s clip, warm)
+### Ceiling math every agent should know (post-G, 2026-11-10)
 
-Wall 113.5s = convert ~1.2 + asr 92.3 (contended; solo 53.1) + align 19.1 +
-ε; diarize ~70s solo, fully hidden. Even a 2× asr only lands ~85–95s wall
-because diarize becomes the binder. ASR backend work is capped at ~1.3× e2e
-until G is done; G is worth ~10% e2e even today (contention tax).
+**600s clip, warm**: wall 92.7s = convert 1.5 + asr 72.1 (contended; solo
+53.1) + align 18.6 + ε; diarize 48.1 contended / 24.1 solo under hop 2.0.
+**Hour-scale (3151s file, measured)**: wall 442.5s = 7.1× real-time; GPU work
+(asr 279 + diarize 127 + align 86 ≈ 492s solo) ≈ wall — the run is AT the
+scheduling floor; one GPU time-slices parallel stages (~11% true concurrency).
+Wall only moves via less GPU work (C2/J/F/Sortformer) or more silicon.
+Turbo-quality ASR on this chip = 11.3× RT solo; "hour in 1 min" (60× RT)
+needs the transducer model class to pass our WER gate (C2) — runtime work is
+measured-dead (D/E). Cloud APIs would hit 60× but are REJECTED: **audio must
+never leave the machine** (settled 2026-11-10, hosting/privacy constraint).
 
 ## 2026-11-08 — A/B/D session 1: low-power trap, q4 data point, cache-key fix
 
@@ -444,3 +459,88 @@ contended (solo 53.1) + align 18.6 + ε. The residual contention tax is
 granularity, also −5-7%) and a streaming/Sortformer diarizer swap (new
 dependency; only worth it if the remaining tax matters). Quality: H
 (hotwords) still cheap and untried.
+
+## 2026-11-10 — hour-scale run, the 9× debate, strategy realignment (cloud OFF, C2 ON)
+
+**Real 52.5-min file (aamir-kelwin-video-ingestion-sync.opus, 3151s)**:
+wall 442.5s = **7.1× real-time** (convert 7.6, asr 347 contended / ~279 solo,
+diarize 218 contended / ~127 solo, align 86.1). Speaker linking worked in the
+wild: one voice matched at 0.919, the other correctly allocated SPEAKER_02
+(new person Kelwin). 1028 segments, ~1000 of whisperx's "failed to align
+(empty segment)" warnings on backchannels — cosmetic, not a regression.
+
+**The GPU-work identity (why scheduling is done):** asr 279 + diarize 127 +
+align 86 ≈ 492s of serialized GPU compute finished in 442.5s wall — the one
+GPU gives ~11% true concurrency beyond time-slicing. PARALLEL_STAGES can't be
+tuned further; wall from here = less GPU work or more silicon.
+
+**User target: 1 hour in 1 min (≈9×, 60× RT).** How commercial services do
+sub-minute synchronous (AAI Universal-2 ~22s/hr; Deepgram nova-3 ~600× RT
+batch): they don't run whisper — single-pass/small-decoder
+transducer-conformer models (~10× less decode compute, quality held by
+training scale) on A100/H100 fleets (~10-30× base-M2 GPU) with chunk fan-out.
+Open-weights equivalents: nvidia canary-1b-flash (883M, >1000 RTFx on A100,
+leaderboard WER 6.35% vs whisper-large-v3 7.44%); canary-1b-v2 ("outperforms
+whisper-large-v3 on English, 10× faster", arXiv 2509.14128).
+
+**Key nuance reopening the algorithm track:** parakeet-tdt-0.6b-v3 BEATS
+whisper-large-v3 on the Open ASR leaderboard (6.32% vs 7.44%) yet failed our
+WER gate badly (0.294 vs turbo's 0.177) → our accented WebEx audio is
+adversarial for the family, OR 0.6b (the family's weakest member) is just too
+small for hard meeting audio. C2 = test the class at proper size (canary-1b
+flash + v2) through the same WER harness. Honest prior: 50/50 — canary
+already underperforms whisper on accented speech elsewhere (Quebec French
+benchmarks), and our speakers are exactly that profile.
+
+**Decision (settled with user):** cloud API backend is REJECTED — the audio
+must never leave the machine; this is a self-hosted service. All future
+speed work is local-only. Remaining levers: C2 (canary spike), J (native
+word timestamps), F (cue merge, needs user OK), Sortformer diarizer swap,
+and the quality items H/I.
+
+## 2026-11-10 — C2 REJECTED: the transducer family fails our WER gate at every tested size
+
+Spike setup (throwaway envs in /tmp, nothing shipped): NeMo for canary
+(`nemo_toolkit[asr]`, torch CPU — **pynini, the usual macOS blocker, turned
+out unnecessary** for canary ASR inference), parakeet-mlx 0.7.0 for TDT.
+All candidates driven through the pipeline's EXACT chunker (whisperx
+Pyannote VAD, 30s chunks; 23 chunks / 585s speech for the 600s eval file).
+One WER harness for everyone — whisper-normalizer (leaderboard-style EN
+normalization) + word-levenshtein vs the ct2 full-file baseline
+(`Output/s3-and-research.vtt`, window-filtered to 600s):
+
+| model | WER @600s | decode time @600s |
+| --- | --- | --- |
+| **turbo-MLX fp16 (control)** | **0.088** | 53.1s GPU (11.3× RT) |
+| canary-1b-flash (883M) | 0.136 | ~3× RT CPU (5s→1.6s probe) |
+| parakeet-tdt-1.1b (MLX, bf16) | 0.144 | 23.0s GPU (25× RT) |
+| canary-1b-v2 (1B) | 0.156 | CPU, slower than flash |
+| parakeet-tdt-0.6b-v3 (prior spike) | ~0.29 (old harness) | 19.5–21.3s GPU |
+
+(These absolutes use the leaderboard normalizer — the in-repo bench's 0.177
+turbo figure is its own metric; only same-harness comparisons gate.)
+
+- **Quality verdict**: every candidate ≥ 1.55× turbo's error. Forensics
+  (flash vs turbo, 250 diffs/1757 words): a DIFFERENT error profile, not a
+  better one — both garble the name ("amir"/"amiria"), real drops and clause
+  insertions on both sides, filler style drift. Same shape as the 0.6b
+  parakeet finding.
+- **Family size curve on our audio**: parakeet 0.6b ~0.29 → 1.1b 0.14;
+  canary-1b 0.14–0.16. Bigger halved the error but turbo is still 1.6×+
+  ahead. Extrapolated parakeet-tdt-2b-v3 ≈ 0.10–0.12 — probably still short,
+  NeMo-CPU-only (no MLX port; 2b on CPU ≈ 20-40 min/600s) → NOT chased. If
+  someone ports 2b-v3 to MLX, revisit with the same harness.
+- **Speed is moot anyway**: parakeet-1.1b decodes 25× RT on the GPU (would be
+  fast enough), but canary on CPU is ~3× RT — a regression vs turbo-MLX; no
+  MLX canary exists.
+- **Why the services still win**: they run this model class on A100/H100
+  fleets (canary-flash: >1000 RTFx there vs 3× RT on our CPU) AND their WER
+  edge on leaderboards doesn't transfer to our audio. Local + this chip +
+  this quality bar = turbo-MLX stays.
+
+**Consequence: the 60×-RT ("hour in 1 min") target is now measured-dead on
+this chip for open-weights ASR.** The answer to that target is hardware
+(faster Apple silicon / discrete GPU running the local stack), not
+algorithms. Remaining local levers: J (native word timestamps, ~−20% wall,
+quality-gated), F (cue merge, needs user OK), Sortformer diarizer (residual
+contention), H (hotwords, quality).
