@@ -283,28 +283,24 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   (align is 86s/hour uncontended). QUALITY-GATED on timestamp accuracy, not
   WER. Cheap probe: compare word-time deltas on the 600s clip.
   (C3 rejected → this is back to an independent probe.)
-- [ ] **K. Verification-based diarization (classify, don't cluster)** —
-  reuse the ASR path's VAD segments (already computed), one wespeaker
-  embedding per segment, cosine-match against the enrolled roster
-  (.speakers.json); escalate to the full pyannote path ONLY on no-match
-  (new voice), low margin, or overlap frames. Recurring meetings (the
-  actual workload) hit the fast path always; first file with a new voice
-  pays full diarize once. Est. diarize solo 24s → 4-8s @600s (one crop per
-  segment vs ~590 window-crops), contention tax → ~0. Gates: SpeakerAcc
-  ≥99% (word-speaker agreement harness), diarize wall −70%+, cold-start
-  fallback correct. **New-speaker detection (clarified 2026-11-10): yes, it
-  is just a voice embedding** — each VAD segment's embedding gets its max
-  cosine against ALL enrolled centroids; max < threshold ⇒ voice nobody on
-  the roster could have produced ⇒ new tag (next unused), enroll its
-  segments, and escalate THAT file to full pyannote to get clean turns for
-  the new voice (cold start = every voice is new = full pyannote, i.e.
-  exactly today's path). Same threshold/threshold-calibration as speaker
-  linking (.speakers.json cosines, biased high). Risk to probe: VAD segments
-  can span a speaker turn (merged crops → mixed embeddings → diluted
-  cosines); mitigation = sub-split segments >N s before embedding, or match
-  at window level like pyannote does.
+- [~] **K. Verification-based diarization (verify + refine)** — probe DONE
+  2026-11-10 (see dated entry): identity matching works (file-centroid
+  known 0.764–0.958 vs unknown ≤0.448; embed ~13s/hour vs 127s stage →
+  −24% hour wall projected) but per-window absolute thresholds misfire
+  (known voices 0.52–0.60 mean) and blanket replacement = 95–98.7%
+  agreement vs the ≥99% gate — with 88–100% of disagreeing duration
+  within 2–3s of a pyannote turn boundary (boundary artifacts, not
+  identity errors). Design per data: embed VAD windows → light cluster →
+  file-level centroid verify vs roster → all-known files get argmax
+  labels + boundary refinement (pyannote segmentation head ONLY in ±3s
+  transition/low-margin neighborhoods, ~6% of stage cost over ~15% of
+  audio); any unknown voice or weak margin → full pyannote (today's path
+  = quality floor). Gates unchanged: SpeakerAcc ≥99% word-level, diarize
+  wall −70%+, cold-start/new-voice fallback = exact current behavior.
+  Untested before ship: clustering without GT labels; boundary-refine
+  word-level acceptance; second kelwin file for cross-file re-ID.
   Lit: TS-VAD+ (APSIPA'25), online target-speaker
-  tracking, Target Speaker Tagging benchmark 2026.
+  tracking, Target Speaker Tagging benchmark 2026. → claude (2026-11-10)
 - [ ] **L. Entity-resolution cascade (subsumes H)** — three layers,
   cheapest first, all local, scored with the scoreboard (EntityAcc /
   DamageRate / T1): L0 decode-time biasing (per-chunk initial_prompt on the
@@ -722,3 +718,61 @@ detection = max cosine vs enrolled roster below threshold (it is just a
 voice embedding, with a mixed-embedding risk to probe); L's two-tier output
 contract approved with the user's acceptance rule (T1 quality ≥ current
 state ⇒ worth it even when T1 >> T0), test definition in the L item.
+
+## 2026-11-10 — K probe: verification-based diarization works for identity; errors are boundary artifacts; design revised to verify+refine
+
+Probe (no pipeline changes, read-only): take the ASR path's own VAD segments
+(raw `Binarize` output pre-30s-merge), tile into ≤10s windows (≥1s kept,
+<1s skipped = 1–3% of speech), embed with pyannote community-1's OWN
+wespeaker `_embedding` (masked crops — the identical call the pipeline
+uses), cosine vs the `.speakers.json` roster, compare labels against the
+cached full-pyannote `diarize.json`. Runner: `/tmp/kprobe.py` (uv run).
+
+Three files, three scenarios (GT tags already in roster namespace):
+
+| file | scenario | fast-path wall | window agree | dur-weighted | file-centroid cos vs roster |
+|---|---|---|---|---|---|
+| aamir-kelwin 3151s | 2 known voices | 27.7s (embed 13.1 + vad 14.6) | 95.4% (98.4% pure) | 95.0% | 01→01 **0.936**, 02→02 **0.958** |
+| minsuk-perf-review 1114s | 2 known, UNSEEN file | 10.3s | 95.6% | 98.7% | 00→00 **0.764**, 01→01 **0.906** |
+| s3-and-research 1718s | 1 known + 1 NEW voice | 16.0s | 81.2%* | 80.4%* | 01→01 **0.929**, new→best 0.408 = no match |
+
+*s3 would escalate anyway (unknown voice present); its 81% is argmax
+forced onto an unenrolled voice, not a fast-path failure.
+
+**Findings:**
+1. **Speed prize confirmed.** Embedding is ~13s per hour-file incremental
+   (VAD already runs inside ASR — shared) vs the current diarize stage
+   127s solo → projected hour wall 442.5 → ~335s (−24%). 600s clip:
+   diarize 24.1 → ~4-6s, matching the original K estimate.
+2. **New-voice detection works at FILE level, not window level.** File
+   centroids: known voices 0.764–0.958, unknown ≤0.448 — a canyon; the
+   mixed file (s3: Aamir + stranger) resolves exactly right (0.929 +
+   no-match). Per-window absolute thresholds MISFIRE: known speakers'
+   window cosines average 0.52–0.60 (Kelwin 224/281 windows <0.70) — a
+   0.70 window gate would escalate known voices constantly. The decision
+   must be cluster→centroid→cosine (the proven linking mechanism); the
+   per-window signal that DOES separate is margin: margin<0.10 on 4–8%
+   of windows for known-voice files vs 40% on the unknown-voice file.
+3. **Blanket replacement fails the word gate as-is — but every error is a
+   boundary artifact.** Duration-weighted agreement 95.0/98.7% vs the ≥99%
+   gate; yet 100% (kelwin) / 88% (perf-review) of disagreeing duration
+   lies within 2s of a pyannote turn boundary (100%/100% within 3s).
+   Identity is right; turn placement is coarse because VAD segments snap
+   to window edges. The errors are NOT findable from fast-path label
+   transitions alone (2–30%) — short turns swallowed inside long windows.
+
+**K v2 design (verify + refine), from this data:**
+embed windows → light cluster (2–3, trivial: intra ≥0.9 vs inter ≤0.45
+separation) → file-level centroid verify vs roster (gate ~0.6–0.7).
+Any unknown voice or weak margin → full pyannote (exactly today's path;
+quality floor = current). All-known files → argmax window labels, then
+boundary refinement: run pyannote's segmentation head ONLY in ±3s
+neighborhoods of label transitions + low-margin windows — the head is ~6%
+of diarize cost (embeddings are 94%) over ~15% of audio → a few s/hour.
+
+Honest gaps before implementation claim victory: (a) clustering must run
+without GT labels (probe grouped by pyannote tags); separation says it's
+easy, still untested. (b) Boundary-refine acceptance = word-speaker
+agreement ≥99% vs current pipeline output on kelwin + perf-review + one
+new-voice file. (c) Only one kelwin recording exists — cross-file Kelwin
+re-identification is untestable until file #2.
