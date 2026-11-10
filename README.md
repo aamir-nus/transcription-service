@@ -21,6 +21,21 @@ Output/                         # default transcription output location (created
 
 The engine (`run_pipeline`) runs one model at a time on the critical path, freeing each model before loading the next to keep memory flat — with one structural exception: **diarization depends only on the audio**, so it runs on a worker thread in parallel with ASR+alignment whenever both halves need computing (`PARALLEL_STAGES`). Logs are tagged `[n/7]` so you can see which step is running:
 
+```mermaid
+flowchart TD
+    IN["input audio (any container)"] --> CV["[1/7] convert — ffmpeg → 16 kHz mono mp3"]
+    CV --> VAD["VAD split — pyannote, 30 s speech chunks"]
+    VAD --> ASR["[2/7] ASR — MLX whisper turbo, Apple GPU (fp16)"]
+    ASR --> AL["[4/7] align — wav2vec2 (MPS) → word timestamps"]
+    CV -. "parallel worker (PARALLEL_STAGES)" .-> DZ["[5/7] diarize — pyannote (MPS, 2.0 s hop)"]
+    DZ --> SL["speaker linking — .speakers.json (flock)\nstable cross-file SPEAKER_XX tags"]
+    AL --> ASG["[6/7] assign speakers to words"]
+    SL --> ASG
+    ASG --> OUT["[7/7] script → md / vtt / JSON"]
+```
+
+Every stage checkpointed to `.transcribe_cache/<digest>/` — a failed run resumes from the last completed stage (see "Resume & checkpointing").
+
 1. **`[1/7]` Convert** — normalize the input to 16 kHz mono mp3 via ffmpeg (any container: mp3, m4a, wav, aac, ogg, flac, …).
 2. **`[2/7]` Transcribe** — load `large-v3-turbo` and transcribe. On Apple Silicon the default backend is **MLX whisper on the Apple GPU** (fp16), with the audio first split into speech chunks by whisperx's own VAD; faster-whisper/CTranslate2 (CPU) is the fallback backend (`ASR_BACKEND`).
 3. **`[3/7]` Free ASR** — drop the model, reclaim memory (CT2 backend; the MLX model stays cached in-process).
@@ -34,6 +49,52 @@ per-stage breakdown:
 
 ```
 [done] pipeline complete: 412 segments in 98.4s (convert 1.2, asr 42.3, align 8.1, diarize 40.5, assign 0.4, build 0.1)
+```
+
+## Code surface (input/output signatures)
+
+**Engine** — `transcribe.py`:
+
+```python
+run_pipeline(
+    audio_path: str,
+    *,
+    language: str | None = None,      # e.g. "en"; auto-detects if omitted
+    min_speakers: int | None = None,  # diarization bounds (both optional)
+    max_speakers: int | None = None,
+    batch_size: int = BATCH_SIZE,     # from .env (8); speed-only, cache-excluded
+    resume: bool = RESUME,            # from .env (true); False = full re-run
+) -> list[dict]
+```
+
+Returns the **script** — the shape every format renders from:
+
+```python
+[
+    {"time": {"start": 0.0, "end": 1.234}, "speaker": "SPEAKER_00", "text": "…"},
+    ...
+]
+```
+
+**Output formats** — `output_format_adapters.py`:
+
+```python
+SUPPORTED_FORMATS = ("md", "vtt")
+
+render(script: list[dict], fmt: str = DEFAULT_FORMAT) -> str
+save(script: list[dict], path: str | Path, fmt: str | None = None) -> Path
+# fmt resolution: explicit fmt > path suffix > DEFAULT_FORMAT ("md").
+# save() creates parent dirs, appends the format's extension if path has
+# no suffix, and returns the resolved path.
+```
+
+**HTTP API** (`serve`):
+
+```python
+POST /transcribe/async/   # multipart: file (required), language?, min_speakers?, max_speakers?, resume?
+                          # -> {"task_id": "<hex>", "status": "pending"}
+GET  /tasks/{task_id}     # -> {"task_id", "status": "pending|processing|completed|failed",
+                          #     "created_at", "result": <script> | None, "error": str | None}
 ```
 
 ## Performance & device strategy
@@ -83,10 +144,23 @@ Config (`.env`):
   (see "Speaker memory" below); `SPEAKER_LINK_THRESHOLD` tunes the match
   cutoff.
 
-Measured warm and back-to-back on a base M2 (4 P-cores, 16 GB): a 10-minute
-WebEx recording runs the full pipeline in ~115s (~5× real-time); the same clip
-on the ct2-only stack takes ~217s (~1.9× slower). Short clips are dominated by
-model-load time (~3–4s total), so the gap there is smaller (~1.8×).
+Measured warm and back-to-back on a base M2 (4 P-cores, 16 GB) — stage-wise
+wall-clock ("contended" = while sharing the one GPU with the parallel
+diarize worker; "solo" = alone):
+
+| stage                     | 600s clip      | 52.5-min file | notes                       |
+| ------------------------- | -------------- | ------------- | --------------------------- |
+| convert (ffmpeg)          | 1.5s           | 7.6s          | CPU                         |
+| ASR (MLX turbo, fp16)     | 72.1s / 53.1s  | 347.0s / ~279s | contended / solo            |
+| align (wav2vec2, MPS)     | 18.6s          | 86.1s         | runs after diarize finished |
+| diarize (pyannote, 2.0s hop) | 48.1s / 24.1s | 218.2s / ~127s | parallel worker             |
+| linking + assign + build  | ~0.1s          | ~0.1s         | CPU                         |
+| **total**                 | **92.7s** (~6.5× real-time) | **442.5s** (~7.1× real-time) | |
+
+The same 600s clip on the ct2-only stack takes ~217s (~2.3× slower). Short
+clips are dominated by model-load time (~3–4s total), so the gap there is
+smaller (~1.8×). One GPU means parallel stages time-slice it — overlap hides
+the smaller job rather than truly running both at once.
 
 ### Benchmarking short clips
 

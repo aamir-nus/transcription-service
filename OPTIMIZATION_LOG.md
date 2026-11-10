@@ -239,14 +239,14 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   vs turbo-MLX's 0.088 (same harness, same VAD chunks, same reference).
   Leaderboard parity does not transfer to our accented WebEx audio at any
   tested size; the transducer family is closed locally.
-- [~] **C3. Qwen3-ASR via `mlx-qwen3-asr`** — the last ASR-swap candidate
-  (2026-11-10 scan): first model smaller AND faster than turbo while
-  claiming higher WER; MLX-native, no torch, native word-timestamp aligner
-  (kills the align stage too) and native `--context` biasing. Spike 0.6B +
-  1.7B through the same WER harness + VAD chunks. Gate: WER ≤ turbo's 0.088
-  on BOTH eval files; prize: ~2-3× asr + align stage gone + L0 entity
-  biasing free. Prior guarded: 4 leaderboard families already failed our
-  gate — but none had an LLM decoder or this speed. → claude (2026-11-10)
+- [x] **C3. Qwen3-ASR via `mlx-qwen3-asr`** — REJECTED 2026-11-10 (see dated
+  entry): 0.6B WER 0.170 @ 49.8s, 1.7B 0.149 @ 187.0s vs turbo 0.088 @
+  53.1s (same chunks/harness). Family's fp16 ceiling misses the gate by
+  70%; quants can only be worse; 1.7B is 3.5× slower besides. The
+  ASR-engine search space is now closed with data — every non-whisper
+  family tested (parakeet, canary, qwen3) lands 0.13-0.30 on our accented
+  WebEx audio while whisper enc-dec sits at 0.088. J (whisper-native
+  timestamps) reverts to independent probe.
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
@@ -282,8 +282,7 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   whisper's own DTW timestamps vs wav2vec2's; if accuracy holds, −20% wall
   (align is 86s/hour uncontended). QUALITY-GATED on timestamp accuracy, not
   WER. Cheap probe: compare word-time deltas on the 600s clip.
-  (Superseded by C3's native aligner if C3 lands; probe independently
-  otherwise.)
+  (C3 rejected → this is back to an independent probe.)
 - [ ] **K. Verification-based diarization (classify, don't cluster)** —
   reuse the ASR path's VAD segments (already computed), one wespeaker
   embedding per segment, cosine-match against the enrolled roster
@@ -293,20 +292,47 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   pays full diarize once. Est. diarize solo 24s → 4-8s @600s (one crop per
   segment vs ~590 window-crops), contention tax → ~0. Gates: SpeakerAcc
   ≥99% (word-speaker agreement harness), diarize wall −70%+, cold-start
-  fallback correct. Lit: TS-VAD+ (APSIPA'25), online target-speaker
+  fallback correct. **New-speaker detection (clarified 2026-11-10): yes, it
+  is just a voice embedding** — each VAD segment's embedding gets its max
+  cosine against ALL enrolled centroids; max < threshold ⇒ voice nobody on
+  the roster could have produced ⇒ new tag (next unused), enroll its
+  segments, and escalate THAT file to full pyannote to get clean turns for
+  the new voice (cold start = every voice is new = full pyannote, i.e.
+  exactly today's path). Same threshold/threshold-calibration as speaker
+  linking (.speakers.json cosines, biased high). Risk to probe: VAD segments
+  can span a speaker turn (merged crops → mixed embeddings → diluted
+  cosines); mitigation = sub-split segments >N s before embedding, or match
+  at window level like pyannote does.
+  Lit: TS-VAD+ (APSIPA'25), online target-speaker
   tracking, Target Speaker Tagging benchmark 2026.
 - [ ] **L. Entity-resolution cascade (subsumes H)** — three layers,
   cheapest first, all local, scored with the scoreboard (EntityAcc /
   DamageRate / T1): L0 decode-time biasing (per-chunk initial_prompt on the
   MLX path — our chunked calls bias EVERY chunk; faster-whisper `hotwords`
-  on ct2; Qwen3 `--context` if C3 lands; lit: up to 88% relative cut on
+  on ct2; lit: up to 88% relative cut on
   bias words). L1 deterministic post-resolve (glossary + fuzzy match +
   speaker-conditioned variant clustering — amiria/amiru/ameer said BY the
   same interlocutor link via our diarize tags; no LLM, milliseconds). L2
   selective LLM correction (LFM on LM Studio ~50 tps; entity-bearing spans
   only ≈ 30-90s/hour; must not run on the critical path; DamageRate gate
-  ~0). Output contract question for the user: is a two-tier artifact
-  (fast .md now, corrected .md shortly after) acceptable?
+  ~0). **Output contract SETTLED 2026-11-10: two-tier artifact approved.**
+  Acceptance rule (user): the corrected tier is worth its extra wall time iff
+  its quality matches or beats the current single-tier pipeline — even if the
+  gap between tiers is large. ("If we can produce a copy at 40s and a
+  corrected copy at 140s, that 100s is still worth it if the final quality
+  matches or beats current state, since current state is 500s for a 50-min
+  recording.") Two-tier test definition (run on the 600s eval file + one
+  hour-scale file, compare vs a same-day current-state run):
+  1. T0 = wall to tier-1 artifact (fast .md, no correction layers).
+  2. T1 = wall to tier-2 artifact (L0+L1+L2 applied).
+  3. Quality per tier: WER_t1, WER_t2 vs current-state WER (same harness,
+     turbo control anchored).
+  4. EntityAcc + DamageRate per tier (hand-listed entity set).
+  5. SpeakerAcc unchanged between tiers (correction must not touch speaker
+     tags).
+  6. Ship gate: WER_t2 ≤ current-state WER + noise, EntityAcc_t2 ≥
+     current, DamageRate_t2 ≈ 0, and T1 < current-state wall. T1 >> T0 is
+     fine by design.
 - [x] **G. Faster/streaming diarizer** — SHIPPED 2026-11-08 (see entry below):
   segmentation hop 2.0s (`DIARIZE_SEG_STEP`) → diarize 2.0× solo, e2e −22%
   @600s, 100% final word-speaker agreement, linking intact. Remaining
@@ -657,3 +683,42 @@ apples-to-apples on the same eval files):**
   regression beyond noise on every other axis; "fast+selective" beats
   "correct-everywhere" iff equal EntityAcc/WER at lower T1 or better
   EntityAcc at equal T1.
+
+## 2026-11-10 — C3 REJECTED: qwen3-asr family fails the WER gate; the ASR-engine search is closed
+
+Spike: `mlx-qwen3-asr` (MLX-native, LLM-decoder ASR), same protocol as C2 —
+project VAD chunker (`/tmp/vad_chunk.py`, pyannote VAD + merge_chunks(30)),
+23 chunks / 585.1s speech from `Data/s3-and-research-600s.opus`, scored by
+`/tmp/wer.py` against `Output/s3-and-research.vtt` (turbo control 0.088).
+
+| model | WER | decode wall | RT factor |
+|---|---|---|---|
+| turbo-MLX (control) | 0.088 | 53.1s solo | 11.3× |
+| Qwen3-ASR-0.6B fp16 | 0.170 | 49.8s (incl. load) | ~11.7× |
+| Qwen3-ASR-1.7B fp16 | 0.149 | 187.0s | ~3.1× |
+
+- Both fail the ≤0.088 gate. 1.7B fp16 is the family's quality ceiling on
+  this box → quants (only worse) close the rest of the family. 1.7B is also
+  3.5× slower than turbo, so even a WER pass would have been a hard sell
+  against the ceiling math (asr is the biggest GPU block).
+- 0.6B is speed-par with turbo (its "faster" claims are vs whisper-large,
+  not turbo) — so there was never a speed prize on the 0.6B anyway.
+- `context=` biasing (Qwen3's headline feature) is L0's job in the cascade
+  regardless of backend; turbo gets the same play via per-chunk
+  initial_prompt. Engine gate is bare quality, and it failed.
+- Package notes for posterity: `load_model()` returns a tuple — pass the
+  model string to `transcribe()/transcribe_batch()`; runner `/tmp/qwen_run.py`.
+- **Closing the space**: every non-whisper family measured on our accented
+  WebEx audio — parakeet-0.6b 0.294, parakeet-tdt-1.1b 0.144,
+  canary-1b-flash 0.136, canary-1b-v2 0.156, qwen3-0.6b 0.170,
+  qwen3-1.7b 0.149 — vs whisper turbo 0.088. Leaderboard parity does not
+  transfer to this domain. ASR-engine swaps are DONE as a speed lever;
+  remaining speed levers are J (drop align via whisper-native timestamps)
+  and K (classify-don't-cluster diarization); remaining quality levers are
+  L (entity cascade, two-tier artifact) and I (overlap, gated).
+
+Also settled this session (recorded in the checklist): K's new-speaker
+detection = max cosine vs enrolled roster below threshold (it is just a
+voice embedding, with a mixed-embedding risk to probe); L's two-tier output
+contract approved with the user's acceptance rule (T1 quality ≥ current
+state ⇒ worth it even when T1 >> T0), test definition in the L item.
