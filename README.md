@@ -27,8 +27,10 @@ flowchart TD
     CV --> VAD["VAD split — pyannote, 30 s speech chunks"]
     VAD --> ASR["[2/7] ASR — MLX whisper turbo, Apple GPU (fp16)"]
     ASR --> AL["[4/7] align — wav2vec2 (MPS) → word timestamps"]
-    CV -. "parallel worker (PARALLEL_STAGES)" .-> DZ["[5/7] diarize — pyannote (MPS, 2.0 s hop)"]
-    DZ --> SL["speaker linking — .speakers.json (flock)\nstable cross-file SPEAKER_XX tags"]
+    CV -. "parallel worker (PARALLEL_STAGES)" .-> FAST["[5/7] diarize ladder — fast (default):\nVAD windows → embeddings → cluster → roster verify\n+ frame refinement (identity probe)"]
+    FAST -->|"preconditions fail, or auto doubts"| FULL["escalate: full pyannote\n(same loaded model)"]
+    FAST --> SL["speaker memory — .speakers.json (flock)\nrefresh enrolled (fast) / link (full)"]
+    FULL --> SL
     AL --> ASG["[6/7] assign speakers to words"]
     SL --> ASG
     ASG --> OUT["[7/7] script → md / vtt / JSON"]
@@ -40,7 +42,7 @@ Every stage checkpointed to `.transcribe_cache/<digest>/` — a failed run resum
 2. **`[2/7]` Transcribe** — load `large-v3-turbo` and transcribe. On Apple Silicon the default backend is **MLX whisper on the Apple GPU** (fp16), with the audio first split into speech chunks by whisperx's own VAD; faster-whisper/CTranslate2 (CPU) is the fallback backend (`ASR_BACKEND`).
 3. **`[3/7]` Free ASR** — drop the model, reclaim memory (CT2 backend; the MLX model stays cached in-process).
 4. **`[4/7]` Align** — load the alignment model, refine word timestamps, free it. (Skipped gracefully on unsupported languages.)
-5. **`[5/7]` Diarize** — load the WhisperX diarization pipeline using `HF_TOKEN`, detect speakers, free it (runs in parallel with 2–4 when both halves need computing). Known voices are then linked to their stable cross-file tags (see "Speaker memory" below).
+5. **`[5/7]` Diarize (strategy ladder)** — load the WhisperX diarization pipeline once, then: **fast** (default) embeds VAD windows, clusters the voices, verifies them against the speaker store, and refines turn boundaries on the diarizer's own frame-level segmentation substrate; anything it can't vouch for (unknown voice, too many voices, no roster, …) **escalates to the full pyannote pipeline on the same loaded model** — output identical to the classic path. `auto` additionally escalates on weak quality signals; `pyannote` never tries fast (see "Diarization strategy ladder"). Runs in parallel with 2–4 when both halves need computing; known voices keep their stable cross-file tags either way (see "Speaker memory" below).
 6. **`[6/7]` Assign speakers** — map speakers onto segments.
 7. **`[7/7]` Build script** — emit a list of `{ "time": { "start", "end" }, "speaker", "text" }`.
 
@@ -62,6 +64,7 @@ run_pipeline(
     language: str | None = None,      # e.g. "en"; auto-detects if omitted
     min_speakers: int | None = None,  # diarization bounds (both optional)
     max_speakers: int | None = None,
+    diarize_mode: str | None = None,  # "fast" | "auto" | "pyannote"; .env default (fast)
     batch_size: int = BATCH_SIZE,     # from .env (8); speed-only, cache-excluded
     resume: bool = RESUME,            # from .env (true); False = full re-run
 ) -> list[dict]
@@ -91,7 +94,8 @@ save(script: list[dict], path: str | Path, fmt: str | None = None) -> Path
 **HTTP API** (`serve`):
 
 ```python
-POST /transcribe/async/   # multipart: file (required), language?, min_speakers?, max_speakers?, resume?
+POST /transcribe/async/   # multipart: file (required), language?, min_speakers?, max_speakers?,
+                          #          diarize_mode? ("fast"|"auto"|"pyannote", else 400), resume?
                           # -> {"task_id": "<hex>", "status": "pending"}
 GET  /tasks/{task_id}     # -> {"task_id", "status": "pending|processing|completed|failed",
                           #     "created_at", "result": <script> | None, "error": str | None}
@@ -140,6 +144,16 @@ Config (`.env`):
   are processed: upstream's 1.0s costs ~2× the diarize time for ~1.6%
   frame-level speaker differences on our eval audio; `1.0` restores upstream
   behavior exactly.
+- `DIARIZE_MODE=fast` — diarization strategy ladder: `fast` (default) / `auto`
+  / `pyannote`; see "Diarization strategy ladder" below.
+- `DIARIZE_FAST_MAX_VOICES=4` — the fast path escalates beyond this many
+  simultaneous voices.
+- `DIARIZE_FAST_CLUSTER_THRESHOLD=0.50` / `DIARIZE_FAST_MERGE_THRESHOLD=0.65` —
+  window→voice join and fragment-merge cosines in the fast path's clustering.
+- `DIARIZE_FAST_REFINE=0.10` — fast-path refinement knob: window roster-margin
+  threshold for the `auto` quality stat; `0` disables frame-level refinement.
+- `DIARIZE_FAST_MAX_FLIP=0.20` — escalate when refinement moves more than this
+  fraction of speech frames off the coarse window labels.
 - `SPEAKER_LINKING=true` — link voices to stable speaker tags across files
   (see "Speaker memory" below); `SPEAKER_LINK_THRESHOLD` tunes the match
   cutoff.
@@ -162,6 +176,16 @@ clips are dominated by model-load time (~3–4s total), so the gap there is
 smaller (~1.8×). One GPU means parallel stages time-slice it — overlap hides
 the smaller job rather than truly running both at once.
 
+The table above is the full-pyannote diarize path. With the default `fast`
+ladder the diarize stage itself runs 1.9–2.1× faster (measured back-to-back:
+21.3s vs 41.3s on a 16-min file, 75.3s vs ~157s on the 52.5-min file) — and
+since diarize is the smaller job either way, it stays fully hidden under ASR
+in parallel mode, so end-to-end wall-clock is unchanged; the win shows up in
+sequential runs (`PARALLEL_STAGES=false`) and as headroom on longer files.
+Note the ladder re-runs VAD on its worker (~15s/hour) instead of persisting
+the ASR pass's speech regions — hidden under ASR, and it keeps the worker
+independent of the ASR backend.
+
 ### Benchmarking short clips
 
 `benchmarks/bench_transcribe.py` runs the pipeline on 90s/120s snippets, prints
@@ -181,6 +205,48 @@ uv run python3 benchmarks/bench_transcribe.py --devices mps cpu
 > ⚠️ Short clips (90s/120s) **understate** the diarization win — it scales
 > super-linearly on CPU, so the gap only opens at scale. Use a 600s+ clip (or
 > the full file) to see the real speedup.
+
+## Diarization strategy ladder
+
+Stage 5 picks a strategy per file — `DIARIZE_MODE` in `.env`,
+`--diarize-mode` on the CLI, `diarize_mode` on the API:
+
+| mode       | behavior                                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------------- |
+| `fast` (default) | window-embedding fast path with roster verification; escalates when any precondition fails     |
+| `auto`     | same, plus escalates on weak quality signals (low-margin windows)                                    |
+| `pyannote` | never try fast — exactly the classic pipeline                                                        |
+
+The fast path tiles VAD speech into ≤10s windows, embeds them in batches with
+the diarizer's **own** embedding model, clusters them with deterministic numpy
+code, and verifies every voice against `.speakers.json` (cos ≥ 0.70, the same
+threshold speaker linking uses). Turn boundaries then get frame-level (~16ms)
+refinement on the diarizer's segmentation substrate, where each channel is
+identified by a **masked-crop embedding** — pyannote's own channel-identification
+mechanism, applied surgically to boundary-adjacent chunks — because supervision
+from time labels goes blind (or backwards) on turns shorter than a window.
+
+Escalation is the quality floor: the full pyannote pipeline runs on the same
+already-loaded model, so an escalated file's output is identical to `pyannote`
+mode (only the wasted fast attempt is paid, ~15–40s/hour).
+
+| escalates when (fast + auto)                                          | why                                      |
+| --------------------------------------------------------------------- | ---------------------------------------- |
+| speaker linking off, empty roster, or <2 usable windows               | nothing to verify against                |
+| more than `DIARIZE_FAST_MAX_VOICES` (4) voices                        | clustering lost confidence               |
+| voices outside the requested min/max speakers                         |                                          |
+| any voice's best roster cosine < 0.70                                 | unknown speaker in the file              |
+| refinement moves > `DIARIZE_FAST_MAX_FLIP` (20%) of speech frames     | the fast path's two views disagree       |
+| any exception inside the fast path                                    | safety net                               |
+| low-margin windows > 15% (**auto only**)                              | weak identity evidence                   |
+
+Measured word-speaker agreement against the pyannote reference on the eval
+files: **98.4%** (16-min) and **98.1%** (52-min) — at the ceiling of what any
+one-speaker-per-frame method can score against an overlap-capable reference:
+the reference itself rasterized to an exclusive trace scores 98.4/98.6, and
+every remaining miss is a word inside a simultaneous-speech span (pyannote
+keeps overlapping turns there; the fast trace, like any exclusive labeling,
+picks the dominant voice). Methodology and numbers in `OPTIMIZATION_LOG.md`.
 
 ## Speaker memory (stable speaker tags)
 
@@ -227,7 +293,7 @@ Per-job folder (`.transcribe_cache/<digest>/`):
 | `converted.mp3` | 1     | the normalized 16 kHz mono audio                     |
 | `asr.json`      | 2     | raw ASR result (the expensive one)                   |
 | `aligned.json`  | 4     | word-aligned result                                  |
-| `diarize.json`  | 5     | `{"turns": [{start, end, speaker}, …], "embeddings": {tag: centroid}}` (embeddings half present with speaker linking) |
+| `diarize.json`  | 5     | `{"turns": [{start, end, speaker}, …], "embeddings": {tag: centroid}, "diarization": {strategy, mode, reasons, voices, …}}` (envelope + linking embeddings; pre-envelope bare-list payloads still read) |
 | `final.json`    | 6     | result after speaker assignment                      |
 | `script.json`   | 7     | the final clean script (a hit here = instant return) |
 | `meta.json`     | —    | content hash, params, status, timings                |
@@ -240,7 +306,9 @@ excludes `batch_size` (it doesn't change the output), so tweaking it for memory
 won't bust the cache. It **does** include model name, ASR backend, the per-stage
 devices (`asr_device`, `pipeline_device`), compute type, thread count, language,
 speaker bounds, the diarization model, the segmentation hop
-(`diarize_seg_step`), and speaker linking.
+(`diarize_seg_step`), speaker linking, and the diarization strategy knobs
+(`diarize_mode` + `diarize_fast_*` — switching modes re-runs stage 5, the same
+one-time invalidation the ASR-backend switch had).
 
 - CLI: `--no-resume` ignores the cache and runs the full pipeline.
 - HTTP: `?resume=false` on `POST /transcribe/async/` does the same.
@@ -299,6 +367,7 @@ DEFAULT_OUTPUT_FORMAT=md      # md | vtt  (used when --format and the -o suffix 
 RESUME=true                   # checkpoint each stage; re-runs resume from last success
 CHECKPOINT_DIR=.transcribe_cache   # where checkpoints live (gitignored)
 DIARIZE_MODEL=                # override diarization model (default: pyannote/speaker-diarization-community-1)
+DIARIZE_MODE=fast             # diarization strategy: fast | auto | pyannote (see ladder section)
 ```
 
 > **Device / compute type note:** `int8` quantization is a CUDA-only path in
@@ -319,7 +388,7 @@ uv run python transcribe.py transcribe meeting.m4a --format vtt      # -> ./Outp
 
 # full options
 uv run python transcribe.py transcribe /abs/path/audio.mp3 \
-    --language en --min-speakers 2 --max-speakers 4 \
+    --language en --min-speakers 2 --max-speakers 4 --diarize-mode auto \
     --batch-size 8 --format md --output notes.md
 
 # dump the raw JSON script to stdout instead of a formatted file

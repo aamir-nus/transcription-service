@@ -169,6 +169,58 @@ DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
 # for ~1.6% frame-level speaker changes on our eval audio. 1.0 restores
 # upstream behavior exactly; see OPTIMIZATION_LOG.md.
 DIARIZE_SEG_STEP: float = float(os.getenv("DIARIZE_SEG_STEP", "2.0"))
+# Diarization strategy ladder (see _diarize_mode). 'pyannote' = always the full
+# pipeline. 'fast' (default) = embed VAD windows with the diarizer's own
+# embedding model, cluster them, and verify the file's voice centroids against
+# the speaker roster; escalate to full pyannote only when that is impossible
+# (unknown voice, too many voices, empty roster, clustering failure). 'auto'
+# additionally escalates on weak quality signals (low per-window margin).
+DIARIZE_MODE: str = (os.getenv("DIARIZE_MODE") or "fast").lower()
+# Fast path: escalate to full pyannote when clustering finds more voices than
+# this (the K probe validated 2-3 voice files; clustering gets shakier as
+# voices grow).
+DIARIZE_FAST_MAX_VOICES: int = int(os.getenv("DIARIZE_FAST_MAX_VOICES", "4"))
+# Fast path: greedy clustering cosine threshold (probe measured intra-cluster
+# ~0.9 vs inter-cluster <=0.45 -- 0.5 sits in the canyon).
+DIARIZE_FAST_CLUSTER_THRESHOLD: float = float(
+    os.getenv("DIARIZE_FAST_CLUSTER_THRESHOLD", "0.50")
+)
+# Fast path: centroid-level merge threshold. One voice can split into several
+# clusters when its acoustic mode shifts mid-file (mic change, channel drift);
+# such fragments measured >=0.71 centroid cosine to their main cluster while
+# different voices stayed <=0.51 on the same file. 0.65 sits in that canyon,
+# biased toward NOT merging distinct voices (a missed merge only escalates to
+# full pyannote; a wrong merge silently loses a speaker).
+DIARIZE_FAST_MERGE_THRESHOLD: float = float(
+    os.getenv("DIARIZE_FAST_MERGE_THRESHOLD", "0.65")
+)
+# Fast path: per-window margin (top1-top2 cosine) below which a window counts
+# as low-margin ('auto'-mode escalation stat; measured 4-8% of windows on
+# all-known files vs 40% on an unknown-voice file). 0 disables the frame-level
+# refinement substrate entirely (coarse window labels only -- debug/AB knob).
+DIARIZE_FAST_REFINE: float = float(os.getenv("DIARIZE_FAST_REFINE", "0.10"))
+# 'auto' mode: escalate when more than this fraction of windows is low-margin.
+DIARIZE_AUTO_MAX_LOWMARGIN: float = float(
+    os.getenv("DIARIZE_AUTO_MAX_LOWMARGIN", "0.15")
+)
+# Fast path safety valve: escalate when the refined frame-level trace
+# disagrees with the coarse window labels on more than this speech fraction
+# (the fast path's own two views conflicting = untrustworthy).
+DIARIZE_FAST_MAX_FLIP: float = float(os.getenv("DIARIZE_FAST_MAX_FLIP", "0.20"))
+if DIARIZE_MODE not in {"fast", "auto", "pyannote"}:
+    raise ValueError(f"DIARIZE_MODE must be fast|auto|pyannote, got {DIARIZE_MODE!r}")
+if DIARIZE_FAST_MAX_VOICES < 1:
+    raise ValueError("DIARIZE_FAST_MAX_VOICES must be >= 1")
+for _name in (
+    "DIARIZE_FAST_CLUSTER_THRESHOLD",
+    "DIARIZE_FAST_MERGE_THRESHOLD",
+    "DIARIZE_AUTO_MAX_LOWMARGIN",
+    "DIARIZE_FAST_MAX_FLIP",
+):
+    if not 0.0 < globals()[_name] <= 1.0:
+        raise ValueError(f"{_name} must be in (0, 1]")
+if not 0.0 <= DIARIZE_FAST_REFINE <= 1.0:
+    raise ValueError("DIARIZE_FAST_REFINE must be in [0, 1] (0 disables refinement)")
 # Run diarization on a worker thread alongside ASR+alignment when both halves
 # need computing: diarization depends only on the audio, so the branches are
 # independent. 'auto' enables it with the mlx backend (MLX and MPS share the
@@ -290,8 +342,10 @@ def convert_to_mp3(
 #   asr.json          [2] raw ASR result (the expensive one)
 #   aligned.json      [4] word-aligned result
 #   diarize.json      [5] {"turns": [{"start","end","speaker"}, ...],
-#                     "embeddings": {tag: centroid}} -- the embeddings half is
-#                     present only when speaker linking is on
+#                     "embeddings": {tag: centroid},
+#                     "diarization": {strategy, mode, reasons, ...}} -- the
+#                     embeddings/diarization halves are present only when
+#                     speaker linking is on / the strategy ladder ran
 #   final.json        [6] result after speaker assignment
 #   script.json       [7] the final clean script
 _CKPT_AUDIO = "converted.mp3"
@@ -315,6 +369,7 @@ def _cache_params(
     language: Optional[str],
     min_speakers: Optional[int],
     max_speakers: Optional[int],
+    diarize_mode: Optional[str] = None,
 ) -> dict:
     """Params that change a stage's output -> part of the cache key.
 
@@ -335,6 +390,17 @@ def _cache_params(
         "diarize_model": DIARIZE_MODEL or "default",
         # Changes diarize output (turn boundaries) -> must scope the cache.
         "diarize_seg_step": DIARIZE_SEG_STEP,
+        # Same story for the strategy ladder: fast and pyannote produce
+        # different turn boundaries, and the fast knobs (voice cap, cluster
+        # threshold, refinement) reshape its output. One-time invalidation,
+        # like asr_backend. Escalation-only knobs (auto_max_lowmargin,
+        # max_flip) are excluded: they never change a *successful* fast
+        # output, only whether fast is attempted/kept.
+        "diarize_mode": _diarize_mode(diarize_mode),
+        "diarize_fast_max_voices": DIARIZE_FAST_MAX_VOICES,
+        "diarize_fast_cluster_threshold": DIARIZE_FAST_CLUSTER_THRESHOLD,
+        "diarize_fast_merge_threshold": DIARIZE_FAST_MERGE_THRESHOLD,
+        "diarize_fast_refine": DIARIZE_FAST_REFINE,
         "language": language,  # None == auto-detect
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
@@ -537,6 +603,18 @@ def _parallel_diarize_enabled() -> bool:
     return _effective_asr_backend() == "mlx"
 
 
+def _diarize_mode(override: Optional[str] = None) -> str:
+    """Resolve the diarization strategy: 'pyannote' | 'fast' | 'auto'.
+
+    ``override`` comes from the CLI/API (``--diarize-mode`` / ``diarize_mode``)
+    and beats DIARIZE_MODE from the environment, which defaults to 'fast'.
+    """
+    mode = (override or DIARIZE_MODE).lower()
+    if mode not in {"pyannote", "fast", "auto"}:
+        raise ValueError(f"diarize mode must be fast|auto|pyannote, got {mode!r}")
+    return mode
+
+
 # Single worker so concurrent API jobs never stack diarizations (one GPU).
 _DIARIZE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diarize")
 
@@ -557,22 +635,34 @@ def _run_diarization(
     audio: "np.ndarray",
     min_speakers: Optional[int],
     max_speakers: Optional[int],
-) -> tuple["pd.DataFrame", dict, float]:
-    """Load the diarization pipeline, diarize ``audio``, free it.
+    diarize_mode: Optional[str] = None,
+) -> tuple["pd.DataFrame", dict, float, dict]:
+    """Run the diarization strategy ladder, then free the pipeline.
 
-    Returns ``(segments frame, speaker centroids, elapsed seconds)``. With
-    SPEAKER_LINKING on, the centroids come back alongside the turns (they are
-    pyannote's own per-speaker embedding means, computed for its clustering
-    anyway -- no extra inference). Runs on the main thread or on the diarize
-    worker; it must not touch the Checkpoint (meta.json races with the main
-    thread) -- the caller persists the result after joining.
+    'pyannote' goes straight to the full pipeline. 'fast' (default) and
+    'auto' first try the fast path (VAD-window embeddings verified against
+    the speaker roster -- see the fast-path section above) and escalate to
+    the full pipeline on the same loaded object when the fast path refuses
+    its own result; 'auto' additionally escalates on weak quality signals
+    (a large fraction of low-margin windows). Both rungs' triggers land in
+    ``info["reasons"]``.
+
+    Returns ``(segments frame, centroids, elapsed seconds, info)``. The full
+    pipeline returns its per-speaker centroids alongside the turns (computed
+    for its clustering anyway); the fast path returns its verified per-tag
+    centroids. ``info`` records the ladder decision (strategy, mode,
+    reasons, stats) and is checkpointed next to the turns. Runs on the main
+    thread or on the diarize worker; it must not touch the Checkpoint
+    (meta.json races with the main thread) -- the caller persists the result
+    after joining.
     """
     t0 = time.perf_counter()
     if not HF_TOKEN:
         raise RuntimeError(
             "HF_TOKEN is not set. The diarization model is gated; set HF_TOKEN in .env."
         )
-    log.info("[5/7] running diarization (device=%s)", PIPELINE_DEVICE)
+    mode = _diarize_mode(diarize_mode)
+    log.info("[5/7] running diarization (mode=%s, device=%s)", mode, PIPELINE_DEVICE)
     diarize_kwargs: dict = {"token": HF_TOKEN, "device": PIPELINE_DEVICE}
     if DIARIZE_MODEL:
         diarize_kwargs["model_name"] = DIARIZE_MODEL
@@ -583,9 +673,12 @@ def _run_diarization(
         # window overlap) makes it process ~20x the audio duration. A 2.0s hop
         # halves that for a 2x stage speedup with 98.4% frame-level agreement
         # on our eval audio (see OPTIMIZATION_LOG.md). The Inference bakes its
-        # step at pipeline init, so patch the built object directly.
+        # step at pipeline init, so patch the built object directly. The fast
+        # path's refinement substrate inherits the same patched hop.
         diarize_pipeline.model._segmentation.step = DIARIZE_SEG_STEP
-    try:
+
+    def _full(reasons: list[str]) -> tuple["pd.DataFrame", dict, dict]:
+        info = {"strategy": "pyannote", "mode": mode, "reasons": reasons}
         if SPEAKER_LINKING:
             segments, centroids = diarize_pipeline(
                 audio,
@@ -598,10 +691,57 @@ def _run_diarization(
                 audio, min_speakers=min_speakers, max_speakers=max_speakers
             )
             centroids = {}
+        return segments, (centroids or {}), info
+
+    try:
+        if mode == "pyannote":
+            segments, centroids, info = _full(["mode=pyannote"])
+        elif not SPEAKER_LINKING:
+            # The fast path is roster verification; with speaker memory off
+            # there is nothing to verify against -- always full pipeline.
+            segments, centroids, info = _full(["speaker linking off"])
+        else:
+            try:
+                rows, centroids, info = _fast_diarize(
+                    diarize_pipeline, audio, min_speakers, max_speakers, mode
+                )
+            except Exception as exc:  # safety net: never lose a run to the fast path
+                log.warning(
+                    "[5/7] fast diarization failed (%s: %s); escalating to full pyannote",
+                    type(exc).__name__,
+                    exc,
+                )
+                segments, centroids, info = _full([f"fast path exception: {exc}"])
+            else:
+                escalate: Optional[list[str]] = None
+                if rows is None:
+                    escalate = info["reasons"]
+                elif (
+                    mode == "auto"
+                    and info.get("low_margin_frac", 0.0) > DIARIZE_AUTO_MAX_LOWMARGIN
+                ):
+                    escalate = info["reasons"] + [
+                        f"{info['low_margin_frac']:.0%} of windows below margin "
+                        f"{DIARIZE_FAST_REFINE:.2f} > "
+                        f"DIARIZE_AUTO_MAX_LOWMARGIN={DIARIZE_AUTO_MAX_LOWMARGIN} (auto)"
+                    ]
+                if escalate is not None:
+                    log.warning(
+                        "[5/7] fast diarization escalating to full pyannote (%s)",
+                        "; ".join(escalate),
+                    )
+                    segments, centroids, info = _full(escalate)
+                else:
+                    return (
+                        pd.DataFrame(rows, columns=["start", "end", "speaker"]),
+                        centroids,
+                        time.perf_counter() - t0,
+                        info,
+                    )
+        return segments, centroids, time.perf_counter() - t0, info
     finally:
         log.info("[5/7] releasing diarization pipeline")
         release_model(diarize_pipeline)
-    return segments, (centroids or {}), time.perf_counter() - t0
 
 
 # --------------------------------------------------------------------------- #
@@ -670,6 +810,27 @@ def _write_store(store: dict) -> None:
     tmp = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.tmp-{os.getpid()}")
     tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, SPEAKER_STORE)
+
+
+def _update_entry(entry: dict, unit: "np.ndarray", source_name: str) -> None:
+    """Fold one unit centroid into an existing store entry (running mean).
+
+    The mean is weighted by how many enrollments each side already carries,
+    then re-normalized so the stored centroid stays unit-length. Shared by the
+    linking path (new evidence for a matched or freshly allocated tag) and the
+    fast-path refresh (evidence for a tag verified against the roster).
+    """
+    n = int(entry.get("n_embeddings", 1))
+    prev = _unit_centroid(entry["centroid"])
+    mean = unit + n * prev if prev is not None else unit * (n + 1)
+    norm = float(np.linalg.norm(mean))
+    if norm > 1e-9:
+        mean = mean / norm
+    entry["centroid"] = mean.tolist()
+    entry["n_embeddings"] = n + 1
+    if source_name not in entry.get("files", []):
+        entry.setdefault("files", []).append(source_name)
+    entry["last_seen"] = _now_iso()
 
 
 def _link_speakers(
@@ -777,19 +938,7 @@ def _link_speakers(
                     "last_seen": _now_iso(),
                 }
             else:
-                # Running mean of the unit centroids, weighted by how many
-                # enrollments each side already carries.
-                n = int(entry.get("n_embeddings", 1))
-                prev = _unit_centroid(entry["centroid"])
-                mean = unit + n * prev if prev is not None else unit * (n + 1)
-                norm = float(np.linalg.norm(mean))
-                if norm > 1e-9:
-                    mean = mean / norm
-                entry["centroid"] = mean.tolist()
-                entry["n_embeddings"] = n + 1
-                if source_name not in entry.get("files", []):
-                    entry.setdefault("files", []).append(source_name)
-                entry["last_seen"] = _now_iso()
+                _update_entry(entry, unit, source_name)
             embeddings_out[gtag] = stored[gtag]["centroid"]
 
         store["speakers"] = list(stored.values())
@@ -802,6 +951,829 @@ def _link_speakers(
     return relabeled, embeddings_out
 
 
+def _refresh_enrolled(
+    embeddings: dict[str, list[float]], source_name: str
+) -> dict[str, list[float]]:
+    """Fold a fast-path run's centroids into already-enrolled store entries.
+
+    The fast path only keeps its result when every voice verified against the
+    roster, so its rows already carry global tags -- nothing to relabel and
+    nothing to allocate. This just refreshes those tags' running means (the
+    run is fresh evidence about each voice) under the same exclusive lock
+    ``_link_speakers`` uses. A tag that vanished from the store mid-run is
+    skipped with a warning rather than resurrected: never allocate here.
+    """
+    if not embeddings:
+        return {}
+    lock_path = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        store = _read_store()
+        stored: dict[str, dict] = {s["tag"]: s for s in store["speakers"]}
+        refreshed: dict[str, list[float]] = {}
+        for tag, centroid in embeddings.items():
+            entry = stored.get(tag)
+            unit = _unit_centroid(centroid)
+            if entry is None:
+                log.warning(
+                    "[5/7] speaker refresh: %s vanished from the store mid-run; "
+                    "its rows keep the tag but it is not re-enrolled",
+                    tag,
+                )
+                continue
+            if unit is None:
+                continue
+            _update_entry(entry, unit, source_name)
+            refreshed[tag] = entry["centroid"]
+        store["speakers"] = list(stored.values())
+        _write_store(store)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    return refreshed
+
+
+# --------------------------------------------------------------------------- #
+# Fast diarization (the 'fast'/'auto' rungs of the diarization ladder)
+# --------------------------------------------------------------------------- #
+# The full pyannote pipeline slides a 10s segmentation window over the file
+# and embeds one crop per local speaker per window -- that embedding stage is
+# 94% of the diarize wall-clock. The K probe (OPTIMIZATION_LOG.md) measured
+# that embedding ONE window per VAD region instead (with the diarizer's own
+# embedding model, the same object the full pipeline uses) costs ~13s/hour vs
+# ~127s for the full stage, and that a file's voice centroids separate known
+# from unknown roster voices by a wide cosine canyon (0.76+ vs <=0.45).
+# The fast path exploits exactly that: tile the ASR path's VAD speech regions
+# into <=10s windows, embed them, cluster in numpy, and verify each cluster's
+# centroid against the speaker roster. It only keeps the result when every
+# voice is known and its own frame-level refinement agrees; otherwise the
+# ladder escalates to the full pipeline on the same loaded object, which is
+# exactly today's behavior. All quality gates come from probe measurements.
+_FAST_WIN = 10.0  # embedding window (s) -- matches pyannote's crop length
+_FAST_MIN_SEG = 1.0  # VAD regions shorter than this are skipped (the
+# embedding model NaNs out on too few masked frames)
+_FAST_MERGE_TAIL = 2.0  # trailing window piece shorter than this folds back
+_FAST_BATCH = 32  # embedding/segmentation batch size (pyannote's own)
+_FAST_CHANNEL_MIN = 0.4  # refinement: channel keeps a tag above this activity
+_FAST_EMBED_MASS = 1.0  # unmapped channel activation (s) worth an identity
+# probe -- its masked crop is embedded and matched to the clusters (see
+# _refine_turns: window-level supervision is blind to sub-window turns)
+_FAST_MIN_RUN = 0.15  # refinement: activation flicker shorter than this folds
+# into a neighbor (pyannote's own min_duration_on default is 0 -- its turns
+# can be sub-second, so keep this to flicker removal only)
+
+
+def _read_roster_snapshot() -> dict[str, "np.ndarray"]:
+    """``{tag: unit centroid}`` snapshot of the speaker store (read-only).
+
+    Runs on the diarize worker under a SHARED lock on the sidecar lock file.
+    The worker never writes the store; a shared lock is enough to keep the
+    snapshot consistent against a concurrent main-thread enrollment.
+    """
+    lock_path = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        store = _read_store()
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    snapshot: dict[str, "np.ndarray"] = {}
+    for s in store["speakers"]:
+        unit = _unit_centroid(s.get("centroid", []))
+        if unit is not None:
+            snapshot[s["tag"]] = unit
+    return snapshot
+
+
+def _fast_vad(audio: "np.ndarray") -> tuple[list[dict], float]:
+    """Speech regions via whisperx's Pyannote VAD -- the ASR path's chunker.
+
+    Same VAD model and parameters as ``_transcribe_asr_mlx`` (onset 0.5 /
+    offset 0.363) but keeping the *raw* binarized regions instead of merging
+    them into 30s ASR chunks: diarization wants voice-homogeneous spans, not
+    transcription-sized bites. This is a second VAD pass over audio the ASR
+    path has already VAD-chunked (the ASR chunking is deliberately not
+    persisted); on the worker it hides under ASR in parallel mode.
+    """
+    from whisperx.audio import SAMPLE_RATE
+    from whisperx.vads import Pyannote
+    from whisperx.vads.pyannote import Binarize
+
+    t0 = time.perf_counter()
+    vad = Pyannote(
+        torch.device(PIPELINE_DEVICE),
+        token=None,
+        chunk_size=30,
+        vad_onset=0.5,
+        vad_offset=0.363,
+    )
+    scores = vad(
+        {"waveform": Pyannote.preprocess_audio(audio), "sample_rate": SAMPLE_RATE}
+    )
+    # The binarizer merge_chunks applies internally, minus the 30s merge --
+    # these active regions are the diarization units.
+    regions = Binarize(max_duration=30, onset=0.5, offset=0.363)(scores)
+    segs = [
+        {"start": float(r.start), "end": float(r.end)} for r in regions.get_timeline()
+    ]
+    return segs, time.perf_counter() - t0
+
+
+def _tile_windows(
+    segs: list[dict],
+) -> tuple[list[tuple[float, float, float, int]], float]:
+    """Tile VAD regions into <=``_FAST_WIN`` windows.
+
+    Returns ``(windows, skipped_seconds)`` where each window is
+    ``(win_start, piece_start, piece_end, seg_idx)``: the piece is the part
+    of the window that actually contains speech (the embedding mask zeroes
+    the rest) and a trailing piece shorter than ``_FAST_MERGE_TAIL`` folds
+    into a window ending at the region end.
+    """
+    windows: list[tuple[float, float, float, int]] = []
+    skipped = 0.0
+    for i, seg in enumerate(segs):
+        s, e = seg["start"], seg["end"]
+        if e - s < _FAST_MIN_SEG:
+            skipped += e - s
+            continue
+        p = s
+        while p < e - 1e-6:
+            q = min(p + _FAST_WIN, e)
+            if q < e and e - q < _FAST_MERGE_TAIL:  # fold the tail in
+                q = e
+            windows.append((p, p, q, i))
+            p = q
+    return windows, skipped
+
+
+def _embed_windows(
+    pipeline: "DiarizationPipeline",
+    audio: "np.ndarray",
+    windows: list[tuple[float, float, float, int]],
+) -> tuple["np.ndarray", "np.ndarray", float]:
+    """Embed every window with the diarizer's own embedding model.
+
+    Waveforms are ``_FAST_WIN`` crops starting at ``win_start`` (zero-padded
+    at the file tail) with a sample-resolution mask marking the speech piece
+    -- the exact input contract ``pipeline.model._embedding`` uses internally.
+    Returns ``(unit-normalized embeddings, usable mask, seconds)``; windows
+    whose embedding is NaN or zero-norm (too little masked speech) come back
+    unusable and are dropped by the caller.
+    """
+    t0 = time.perf_counter()
+    if not windows:
+        return np.empty((0, 1)), np.empty(0, dtype=bool), time.perf_counter() - t0
+    emb = pipeline.model._embedding
+    sr = emb.sample_rate
+    n = int(_FAST_WIN * sr)
+    waves: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    for w0, ps, pe, _si in windows:
+        i0 = int(w0 * sr)
+        w = audio[i0 : i0 + n]
+        if len(w) < n:
+            w = np.concatenate([w, np.zeros(n - len(w), dtype=np.float32)])
+        m = np.zeros(n, dtype=np.float32)
+        m[max(int((ps - w0) * sr), 0) : min(int((pe - w0) * sr), n)] = 1.0
+        waves.append(w)
+        masks.append(m)
+    wave_t = torch.from_numpy(np.stack(waves)[:, None, :])
+    mask_t = torch.from_numpy(np.stack(masks))
+    out = []
+    for i in range(0, len(wave_t), _FAST_BATCH):
+        out.append(emb(wave_t[i : i + _FAST_BATCH], masks=mask_t[i : i + _FAST_BATCH]))
+    E = np.concatenate(out).astype(np.float64)
+    norms = np.linalg.norm(E, axis=1)
+    ok = np.isfinite(norms) & (norms > 1e-6)
+    return E[ok] / norms[ok][:, None], ok, time.perf_counter() - t0
+
+
+def _cluster_windows(
+    E: "np.ndarray",
+    durations: "np.ndarray",
+    join_threshold: float,
+    merge_threshold: float,
+) -> tuple[list[int], int]:
+    """Cluster window embeddings into voices (numpy-only, deterministic).
+
+    Four passes, each justified by eval-file measurements (OPTIMIZATION_LOG):
+
+    1. Greedy leaders, duration-desc: the longest unassigned window founds a
+       cluster and claims every still-unassigned window within
+       ``join_threshold`` -- first-claim, cheap seeds on the cleanest speech.
+    2. Lloyd cleanup: recompute duration-weighted unit centroids and move
+       each window to its best-cosine cluster (>= ``join_threshold``) until
+       no window moves. First-claim seeding strands windows on the wrong
+       side of two voices in the same file (a 74/26 mixed cluster on the
+       minsuk-1-1 eval); best-centroid reassignment pulls them back.
+    3. Consolidation: noise clusters (<3 windows AND <1% of speech) fold
+       into their nearest survivor; near-duplicate centroids (>=
+       ``merge_threshold``) merge -- one voice splits into fragments when
+       its acoustic mode drifts mid-file (mic/channel change; fragments
+       measured >=0.71 centroid cosine while distinct voices stayed <=0.51).
+    4. One more Lloyd pass over the consolidated clusters.
+
+    Returns ``(labels 0..k-1, number of raw seeds before consolidation)``.
+    """
+    n = len(E)
+
+    def centroids_of(labs: list[int]) -> tuple[list[int], "np.ndarray"]:
+        cids = sorted(set(labs))
+        cent = []
+        for c in cids:
+            m = np.asarray(labs) == c
+            v = np.average(E[m], axis=0, weights=durations[m])
+            norm = float(np.linalg.norm(v))
+            cent.append(v / norm if norm > 1e-9 else v)
+        return cids, np.stack(cent)
+
+    def lloyd(labs: list[int]) -> list[int]:
+        for _ in range(10):
+            cids, cent = centroids_of(labs)
+            sims = E @ cent.T
+            best = np.argmax(sims, axis=1)
+            moved = False
+            for j in range(n):
+                b = cids[best[j]]
+                if b != labs[j] and sims[j, best[j]] >= join_threshold:
+                    labs[j] = b
+                    moved = True
+            if not moved or len(set(labs)) < 2:
+                break
+        return labs
+
+    # 1. greedy duration-desc leaders
+    labels = [-1] * n
+    order = sorted(range(n), key=lambda i: (-float(durations[i]), i))
+    for i in order:
+        if labels[i] != -1:
+            continue
+        cid = max(labels) + 1
+        labels[i] = cid
+        rest = [j for j in order if labels[j] == -1]
+        if rest:
+            sims = E[rest] @ E[i]
+            for j, sim in zip(rest, sims):
+                if sim >= join_threshold:
+                    labels[j] = cid
+    n_raw = max(labels) + 1
+
+    # 2. pull stranded windows to their best centroid
+    labels = lloyd(labels)
+
+    # 3a. fold noise clusters into the nearest survivor
+    counts: dict[int, int] = {}
+    durs: dict[int, float] = {}
+    for j, cid in enumerate(labels):
+        counts[cid] = counts.get(cid, 0) + 1
+        durs[cid] = durs.get(cid, 0.0) + float(durations[j])
+    survivors = [
+        c
+        for c in sorted(durs)
+        if counts[c] >= 3 or durs[c] >= 0.01 * float(durations.sum())
+    ]
+    if 0 < len(survivors) < len(durs):
+        cids, cent = centroids_of(labels)
+        keep = {c: cent[i] for i, c in enumerate(cids) if c in set(survivors)}
+        for j, cid in enumerate(labels):
+            if cid not in keep:
+                labels[j] = max(survivors, key=lambda c: (float(E[j] @ keep[c]), -c))
+
+    # 3b. merge same-voice fragments (closest centroid pair first)
+    while True:
+        cids, cent = centroids_of(labels)
+        if len(cids) < 2:
+            break
+        best: Optional[tuple[float, int, int]] = None
+        for i in range(len(cids)):
+            for j2 in range(i + 1, len(cids)):
+                score = float(cent[i] @ cent[j2])
+                if score >= merge_threshold and (best is None or score > best[0]):
+                    best = (score, cids[i], cids[j2])
+        if best is None:
+            break
+        _score, a, b = best
+        labels = [a if lab == b else lab for lab in labels]
+
+    # 4. final cleanup over the consolidated clusters
+    labels = lloyd(labels)
+    compact: dict[int, int] = {}
+    return [compact.setdefault(lab, len(compact)) for lab in labels], n_raw
+
+
+def _verify_roster(
+    centroids: list["np.ndarray"], roster: dict[str, "np.ndarray"]
+) -> list[tuple[str, float]]:
+    """Best roster match per cluster centroid (non-exclusive).
+
+    Mirrors ``_link_speakers``: every cluster independently takes its best
+    stored voice -- two clusters may legitimately share a tag when clustering
+    over-split one person. Returns one ``(tag, cosine)`` per cluster.
+    """
+    tags = sorted(roster)
+    C = np.stack([roster[t] for t in tags])
+    matches: list[tuple[str, float]] = []
+    for c in centroids:
+        sims = C @ c
+        best = int(np.argmax(sims))
+        matches.append((tags[best], float(sims[best])))
+    return matches
+
+
+def _coarse_turns(
+    wins: list[tuple[float, float, float, int]], window_tags: list[str]
+) -> list[dict]:
+    """Turns from per-window tags: merge same-tag windows within a VAD region.
+
+    Deliberately no neighborhood smoothing: with 10s windows a turn change
+    lands inside two of any three voting windows, and ablating on the eval
+    files showed median smoothing flipping whole windows near boundaries
+    (93.4% -> 88.9% word agreement) while the frame-level refinement --
+    which has real boundary evidence -- recovers them (96.5% from raw
+    labels). Runs merge only within a region, so turns always break at
+    silence.
+    """
+    rows: list[dict] = []
+    last_si = -1
+    for k, (_w0, ps, pe, si) in enumerate(wins):
+        tag = window_tags[k]
+        if rows and rows[-1]["speaker"] == tag and si == last_si:
+            rows[-1]["end"] = pe
+        else:
+            rows.append({"start": ps, "end": pe, "speaker": tag})
+        last_si = si
+    return rows
+
+
+def _refine_turns(
+    pipeline: "DiarizationPipeline",
+    audio: "np.ndarray",
+    segs: list[dict],
+    coarse: list[dict],
+    centroids: dict[str, "np.ndarray"],
+) -> tuple[list[dict], dict]:
+    """Refine coarse window labels with the diarizer's segmentation substrate.
+
+    The coarse path labels whole 10s windows, so a turn change inside a window
+    lands on the wrong side of the boundary -- the K probe found nearly all
+    fast-path error within 2-3s of a real turn boundary and *not* recoverable
+    from label transitions alone. The segmentation head is cheap (~6% of the
+    full stage) and yields frame-level (~16ms) per-channel activations for the
+    whole file in one batched pass. Its output channels are anonymous and
+    permuted per chunk, so each chunk's channels are mapped to tags under
+    supervision of the coarse labels (a channel keeps its top tag iff it is
+    that tag's best channel and carries >= ``_FAST_CHANNEL_MIN`` of its own
+    activation). Overlapping chunks then contribute their mapped channels'
+    activation mass per frame (soft voting -- ablation showed hard per-chunk
+    argmax saturates ~4 points lower, because it discards how *close* the
+    second voice is at every frame); frames with no mass inherit the coarse
+    label. Turns are re-cut from that frame consensus, breaking at VAD gaps
+    and folding sub-``_FAST_MIN_RUN`` runs into their longer neighbor.
+
+    Supervision alone cannot see turns shorter than a window: a 10s window
+    dominated 8:2 by voice A labels B's channel as A, B never earns vote
+    mass, and whole interjections get swallowed (minsuk-1-1: 38 refined turns
+    vs pyannote's 190, a 4.2s SPEAKER_01 turn fully inside a SPEAKER_00 run).
+    So once, after the first supervised mapping, every *unexplained* channel
+    (>= ``_FAST_EMBED_MASS`` of activation that supervision did not keep) gets
+    an identity probe: its masked crop is embedded -- pyannote's own channel
+    identification mechanism -- and matched against ``centroids`` (the
+    roster-verified cluster centroids). A match at the join threshold
+    overrides supervision: identity evidence outranks blocky timing evidence.
+    Only mixed chunks carry unexplained mass, so the probe costs a fraction
+    of the window-embedding stage.
+
+    Returns ``(rows, stats)``. ``stats["flip_frac"]`` is the speech fraction
+    where the refined trace disagrees with the coarse labels -- the fast
+    path's two independent views of the same audio, and the ladder's T9
+    escalation trigger when they disagree too much.
+    """
+    t0 = time.perf_counter()
+    from whisperx.audio import SAMPLE_RATE
+
+    seg_inf = pipeline.model._segmentation
+    wave = torch.from_numpy(np.asarray(audio, dtype=np.float32))
+    feat = seg_inf({"waveform": wave[None], "sample_rate": SAMPLE_RATE})
+    data = np.asarray(feat.data, dtype=np.float64)
+    if data.ndim != 3:
+        # Without per-chunk channels the channel->tag supervision below is
+        # meaningless (e.g. an aggregated 2D output) -- keep the coarse turns.
+        log.warning(
+            "[5/7] fast diarization: segmentation substrate returned shape %s "
+            "(expected chunks x frames x channels); keeping coarse turns",
+            data.shape,
+        )
+        return coarse, {"flip_frac": 0.0, "fallback": f"shape {data.shape}"}
+    n_chunks, n_frames, _n_channels = data.shape
+    chunk_dur = float(getattr(seg_inf, "duration", 0.0) or 10.0)
+    step = float(getattr(seg_inf, "step", 0.0) or DIARIZE_SEG_STEP)
+    res = chunk_dur / n_frames  # frame resolution (~16ms)
+    tags_list = sorted({r["speaker"] for r in coarse})
+    tag_ids = {t: i for i, t in enumerate(tags_list)}
+    n_global = int(round((n_chunks - 1) * step / res)) + n_frames
+
+    coarse_trace = np.full(n_global, -1, dtype=int)
+    for r in coarse:
+        lo = int(np.floor(r["start"] / res))
+        hi = int(np.ceil(r["end"] / res))
+        coarse_trace[lo:hi] = tag_ids[r["speaker"]]
+    speech = np.zeros(n_global, dtype=bool)
+    for s in segs:
+        speech[int(np.floor(s["start"] / res)) : int(np.ceil(s["end"] / res))] = True
+
+    def _forward_fill(final: np.ndarray) -> np.ndarray:
+        # Label trace over *every* frame: silent/unvoted frames carry the
+        # previous label forward (backfilling the head/tail) so short pauses do
+        # not shred turns -- pyannote labels silent frames too, and its default
+        # min_duration_on/off are 0, so its turns bridge micro-gaps and can be
+        # sub-second long. Breaking runs at any non-speech frame instead cost
+        # several points of word agreement on the eval files (it swallowed the
+        # short GT turns whole).
+        trace = final.copy()
+        valid = np.nonzero(trace >= 0)[0]
+        if len(valid):
+            trace[: valid[0]] = trace[valid[0]]
+            for i in range(valid[0] + 1, valid[-1] + 1):
+                if trace[i] < 0:
+                    trace[i] = trace[i - 1]
+            trace[valid[-1] + 1 :] = trace[valid[-1]]
+        return trace
+
+    def _probe_unexplained(
+        kept: list[dict[int, int]],
+    ) -> dict[int, list[tuple[int, int, float]]]:
+        """Identify channels by masked-crop embedding, not by time labels.
+
+        Supervision goes backwards exactly where it matters: a chunk of pure
+        voice B whose covering window straddled a boundary A-majority gets
+        B's channel mapped to A (minsuk-1-1 chunk [686,696]: 9.9s of pure
+        SPEAKER_01 at masked-crop cos 0.86, supervised as SPEAKER_00), and it
+        then votes for the wrong voice with full mass. So every channel
+        carrying >= ``_FAST_EMBED_MASS`` of activation in a chunk with two or
+        more such channels -- the mixed chunks, and every boundary-adjacent
+        chunk -- is identified by embedding its own masked crop; a lone
+        massy channel is only probed when supervision left it unmapped (pure
+        stretches deep inside a turn are already right).
+        """
+        jobs: list[tuple[int, int]] = []
+        for c in range(n_chunks):
+            act = data[c]
+            massy = [
+                k
+                for k in range(act.shape[1])
+                if act[:, k].sum() * res >= _FAST_EMBED_MASS
+            ]
+            if len(massy) >= 2:
+                jobs.extend((c, k) for k in massy)
+            elif len(massy) == 1 and massy[0] not in kept[c]:
+                jobs.append((c, massy[0]))
+        if not jobs:
+            return {}
+        emb = pipeline.model._embedding
+        sr = emb.sample_rate
+        n = int(round(chunk_dur * sr))
+        spf = n // n_frames  # samples per frame (256 at 16ms/16kHz)
+        waves: list[np.ndarray] = []
+        masks: list[np.ndarray] = []
+        for c, k in jobs:
+            i0 = int(round(c * step * sr))
+            w = audio[i0 : i0 + n]
+            if len(w) < n:
+                w = np.concatenate([w, np.zeros(n - len(w), dtype=np.float32)])
+            m = np.repeat(data[c][:, k], spf).astype(np.float32)
+            if len(m) < n:
+                m = np.concatenate([m, np.zeros(n - len(m), dtype=np.float32)])
+            waves.append(w)
+            masks.append(m[:n])
+        wave_t = torch.from_numpy(np.stack(waves)[:, None, :])
+        mask_t = torch.from_numpy(np.stack(masks))
+        out = []
+        for i in range(0, len(wave_t), _FAST_BATCH):
+            out.append(
+                emb(wave_t[i : i + _FAST_BATCH], masks=mask_t[i : i + _FAST_BATCH])
+            )
+        E = np.concatenate(out).astype(np.float64)
+        tags_c = np.stack([centroids[t] for t in tags_list])
+        fixes: dict[int, list[tuple[int, int, float]]] = {}
+        for (c, k), vec in zip(jobs, E):
+            nrm = float(np.linalg.norm(vec))
+            if not np.isfinite(nrm) or nrm <= 1e-6:
+                continue  # too little masked audio for an identity
+            sims = tags_c @ (vec / nrm)
+            tid = int(np.argmax(sims))
+            if sims[tid] >= DIARIZE_FAST_CLUSTER_THRESHOLD:
+                fixes.setdefault(c, []).append((k, tid, float(sims[tid])))
+        for lst in fixes.values():
+            lst.sort(key=lambda f: -f[2])
+        log.info(
+            "[5/7] fast diarization: identity probe embedded %d unexplained "
+            "channel(s) from mixed chunks, %d matched a voice cluster",
+            len(jobs),
+            sum(len(v) for v in fixes.values()),
+        )
+        return fixes
+
+    # Iterated refinement. Round 0 supervises the per-chunk channel->tag maps
+    # with the *coarse* labels, whose boundaries are blocky at window
+    # granularity: a chunk straddling a real turn change often holds no
+    # supervised frames for the second voice, so that voice's channel stays
+    # unmapped and gets no vote mass near the boundary -- exactly the 1-2s
+    # displacement band in the error anatomy. The identity probe patches the
+    # gaps supervision cannot fill, and the round-0 consensus then places
+    # boundaries at the activation-mass crossover, so re-supervising the maps
+    # with it and re-voting sharpens them further; the loop converges in 2-3
+    # rounds and everything past the substrate pass is cheap numpy.
+    trace = _forward_fill(coarse_trace)
+    embed_fixes: dict[int, list[tuple[int, int, float]]] = {}
+    for _round in range(3):
+        kept = []
+        for c in range(n_chunks):
+            g0 = int(round(c * step / res))
+            frame_tag = trace[g0 : g0 + n_frames]
+            act = data[c]  # (frames x channels) activations
+            score = np.zeros((act.shape[1], len(tags_list)))
+            for tid in range(len(tags_list)):
+                m = frame_tag == tid
+                if m.any():
+                    score[:, tid] = act[m].sum(axis=0)
+            channel_total = score.sum(axis=1)
+            mapping: dict[int, int] = {}
+            for k in range(act.shape[1]):
+                tid = int(np.argmax(score[k]))
+                if score[k, tid] <= 0:
+                    continue
+                if int(np.argmax(score[:, tid])) == k and score[k, tid] >= (
+                    _FAST_CHANNEL_MIN * max(channel_total[k], 1e-9)
+                ):
+                    mapping[k] = tid
+            kept.append(mapping)
+        if _round == 0:
+            embed_fixes = _probe_unexplained(kept)
+        for c, fixes in embed_fixes.items():
+            m = kept[c]
+            for k, tid, _cos in fixes:  # best cosine first
+                for k2 in [kx for kx, tx in m.items() if tx == tid and kx != k]:
+                    del m[k2]
+                m[k] = tid
+        # Frame-level consensus: each covering chunk contributes its mapped
+        # channels' activation mass, so a boundary lands at the mass crossover
+        # between the two voices rather than at some chunk's hard argmax edge.
+        votes = np.zeros((n_global, len(tags_list)))
+        for c in range(n_chunks):
+            if not kept[c]:
+                continue
+            act = data[c]
+            g0 = int(round(c * step / res))
+            for k, tid in kept[c].items():
+                votes[g0 : g0 + n_frames, tid] += act[:, k]
+        won = votes.argmax(axis=1)
+        final = np.where(votes.sum(axis=1) > 0, won, trace)
+        new_trace = _forward_fill(final)
+        if np.array_equal(new_trace, trace):
+            break
+        trace = new_trace
+
+    # T9 measures refinement movement against the *original* coarse view.
+    judged = speech & (coarse_trace >= 0)
+    flip_frac = (
+        float((trace[judged] != coarse_trace[judged]).mean()) if judged.any() else 0.0
+    )
+
+    # Runs = maximal same-label stretches; trim each to the VAD speech inside
+    # it and drop runs with none. Only activation flicker (sub-min-run) folds
+    # into its longer neighbor.
+    runs: list[list[int]] = []  # [start_frame, end_frame, tag_id]
+    start = 0
+    for i in range(1, n_global + 1):
+        if i == n_global or trace[i] != trace[start]:
+            runs.append([start, i, int(trace[start])])
+            start = i
+    trimmed: list[dict] = []
+    for a, b, t in runs:
+        idx = np.nonzero(speech[a:b])[0]
+        if not len(idx):
+            continue
+        trimmed.append(
+            {
+                "start": (a + int(idx[0])) * res,
+                "end": (a + int(idx[-1]) + 1) * res,
+                "speaker": tags_list[t],
+            }
+        )
+    if len(trimmed) > 1:
+        changed = True
+        while changed and len(trimmed) > 1:
+            changed = False
+            for i, r in enumerate(trimmed):
+                if r["end"] - r["start"] >= _FAST_MIN_RUN:
+                    continue
+                prev_r = trimmed[i - 1] if i > 0 else None
+                next_r = trimmed[i + 1] if i + 1 < len(trimmed) else None
+                if prev_r is None:
+                    next_r["start"] = r["start"]
+                elif next_r is None or (prev_r["end"] - prev_r["start"]) >= (
+                    next_r["end"] - next_r["start"]
+                ):
+                    prev_r["end"] = r["end"]
+                else:
+                    next_r["start"] = r["start"]
+                trimmed.pop(i)
+                changed = True
+                break
+    # Single-frame VAD seams can split a turn into two same-tag rows that meet
+    # exactly -- stitch those back.
+    rows: list[dict] = []
+    for r in trimmed:
+        if (
+            rows
+            and rows[-1]["speaker"] == r["speaker"]
+            and r["start"] - rows[-1]["end"] < res
+        ):
+            rows[-1]["end"] = r["end"]
+        else:
+            rows.append(r)
+    stats = {
+        "flip_frac": round(flip_frac, 4),
+        "coarse_turns": len(coarse),
+        "refined_turns": len(rows),
+        "probe_fixed": sum(len(v) for v in embed_fixes.values()),
+        "seconds": round(time.perf_counter() - t0, 2),
+    }
+    log.info(
+        "[5/7] fast diarization: refinement %.1fs, %d chunks, flip_frac %.3f "
+        "(%d coarse -> %d refined turns)",
+        stats["seconds"],
+        n_chunks,
+        flip_frac,
+        len(coarse),
+        len(rows),
+    )
+    return rows, stats
+
+
+def _fast_diarize(
+    pipeline: "DiarizationPipeline",
+    audio: "np.ndarray",
+    min_speakers: Optional[int],
+    max_speakers: Optional[int],
+    mode: str,
+) -> tuple[Optional[list[dict]], dict[str, list[float]], dict]:
+    """One fast-path attempt. Returns ``(rows, centroids_by_tag, info)``.
+
+    ``rows is None`` means the attempt refused its own result -- ``info[
+    "reasons"]`` names the ladder trigger(s) that fired and the caller
+    escalates to the full pipeline. Empty ``rows`` (VAD found no speech) is a
+    *success*: there is nothing for pyannote to diarize either. On success the
+    rows already carry global roster tags (that is what was verified).
+    """
+    info: dict = {"strategy": "fast", "mode": mode, "reasons": []}
+
+    roster = _read_roster_snapshot()
+    if not roster:
+        info["reasons"].append("roster empty -- no enrolled voices to verify against")
+        return None, {}, info
+
+    segs, vad_s = _fast_vad(audio)
+    if not segs:
+        info.update({"voices": 0, "windows": 0})
+        log.info("[5/7] fast diarization: VAD found no speech (%.1fs)", vad_s)
+        return [], {}, info
+    windows, skipped = _tile_windows(segs)
+    log.info(
+        "[5/7] fast diarization: %d VAD regions -> %d windows, %.1fs speech "
+        "skipped <%ss (vad %.1fs)",
+        len(segs),
+        len(windows),
+        skipped,
+        _FAST_MIN_SEG,
+        vad_s,
+    )
+    E, ok, emb_s = _embed_windows(pipeline, audio, windows)
+    wins = [w for w, o in zip(windows, ok) if o]
+    log.info(
+        "[5/7] fast diarization: %d/%d windows embedded in %.1fs",
+        len(wins),
+        len(windows),
+        emb_s,
+    )
+    if len(wins) < 2:
+        info["reasons"].append(f"only {len(wins)} usable window embeddings (<2)")
+        return None, {}, info
+    info["windows"] = len(wins)
+    durs = np.array([w[2] - w[1] for w in wins])
+    labels, n_raw = _cluster_windows(
+        E, durs, DIARIZE_FAST_CLUSTER_THRESHOLD, DIARIZE_FAST_MERGE_THRESHOLD
+    )
+    labels_arr = np.asarray(labels)
+    voices = int(labels_arr.max()) + 1
+    info["voices"] = voices
+    log.info(
+        "[5/7] fast diarization: %d voice cluster(s) (join>=%.2f; %d raw seed(s) "
+        "consolidated at %.2f)",
+        voices,
+        DIARIZE_FAST_CLUSTER_THRESHOLD,
+        n_raw,
+        DIARIZE_FAST_MERGE_THRESHOLD,
+    )
+    if voices > DIARIZE_FAST_MAX_VOICES:
+        info["reasons"].append(
+            f"{voices} voices > DIARIZE_FAST_MAX_VOICES={DIARIZE_FAST_MAX_VOICES}"
+        )
+        return None, {}, info
+    if (min_speakers is not None and voices < min_speakers) or (
+        max_speakers is not None and voices > max_speakers
+    ):
+        info["reasons"].append(
+            f"{voices} voices outside requested [{min_speakers}, {max_speakers}]"
+        )
+        return None, {}, info
+
+    cent: list["np.ndarray"] = []
+    for cid in range(voices):
+        member = labels_arr == cid
+        vec = np.average(E[member], axis=0, weights=durs[member])
+        cent.append(vec / float(np.linalg.norm(vec)))
+    matches = _verify_roster(cent, roster)
+    info["matches"] = {
+        f"cluster {i}": {"tag": tag, "cos": round(score, 3)}
+        for i, (tag, score) in enumerate(matches)
+    }
+    for i, (tag, score) in enumerate(matches):
+        log.info(
+            "[5/7] fast diarization: cluster %d -> %s (cos %.3f)",
+            i,
+            tag,
+            score,
+        )
+        if score < SPEAKER_MATCH_THRESHOLD:
+            info["reasons"].append(
+                f"cluster {i} is an unknown voice (best roster cos "
+                f"{score:.3f} < {SPEAKER_MATCH_THRESHOLD})"
+            )
+    if info["reasons"]:
+        return None, {}, info
+
+    # Per-window roster margins -- the 'auto' escalation stat. The same
+    # threshold doubles as the refinement on/off knob (0 disables both).
+    tags_sorted = sorted(roster)
+    S = E @ np.stack([roster[t] for t in tags_sorted]).T
+    if S.shape[1] > 1:
+        srt = np.sort(S, axis=1)
+        margins = srt[:, -1] - srt[:, -2]
+        low_margin_frac = float((margins < DIARIZE_FAST_REFINE).mean())
+    else:
+        low_margin_frac = 0.0
+    info["low_margin_frac"] = round(low_margin_frac, 4)
+    log.info(
+        "[5/7] fast diarization: %.1f%% of windows below roster margin %.2f",
+        low_margin_frac * 100,
+        DIARIZE_FAST_REFINE,
+    )
+
+    window_tags = [matches[lab][0] for lab in labels]
+    coarse = _coarse_turns(wins, window_tags)
+    if DIARIZE_FAST_REFINE > 0:
+        centroids_by_tag = {matches[cid][0]: cent[cid] for cid in range(voices)}
+        rows, rstats = _refine_turns(pipeline, audio, segs, coarse, centroids_by_tag)
+        info["refined"] = rstats
+        if rstats.get("flip_frac", 0.0) > DIARIZE_FAST_MAX_FLIP:
+            info["reasons"].append(
+                f"refinement flipped {rstats['flip_frac']:.0%} of speech frames "
+                f"> DIARIZE_FAST_MAX_FLIP={DIARIZE_FAST_MAX_FLIP}"
+            )
+            return None, {}, info
+    else:
+        info["refined"] = {"disabled": True}
+        rows = coarse
+    log.info(
+        "[5/7] diarization strategy: FAST -- %d known voices, %d windows, %d turns",
+        voices,
+        len(wins),
+        len(rows),
+    )
+
+    # Per-tag centroids: clusters that share a tag (over-split voice) merge,
+    # duration-weighted -- mirroring the non-exclusive matching above.
+    acc: dict[str, tuple["np.ndarray", float]] = {}
+    for cid, (tag, _score) in enumerate(matches):
+        d = float(durs[labels_arr == cid].sum())
+        if tag in acc:
+            v0, d0 = acc[tag]
+            acc[tag] = ((v0 * d0 + cent[cid] * d) / (d0 + d), d0 + d)
+        else:
+            acc[tag] = (cent[cid], d)
+    centroids_out: dict[str, list[float]] = {}
+    for tag, (v, _d) in acc.items():
+        norm = float(np.linalg.norm(v))
+        centroids_out[tag] = (v / norm if norm > 1e-9 else v).tolist()
+    return rows, centroids_out, info
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline engine core (sequential, blocking)
 # --------------------------------------------------------------------------- #
@@ -811,6 +1783,7 @@ def run_pipeline(
     language: Optional[str] = None,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
+    diarize_mode: Optional[str] = None,
     batch_size: int = BATCH_SIZE,
     resume: bool = RESUME,
 ) -> list[dict]:
@@ -841,7 +1814,8 @@ def run_pipeline(
     ckpt: Optional[Checkpoint] = None
     if resume:
         ckpt = Checkpoint.open(
-            audio_path, _cache_params(language, min_speakers, max_speakers)
+            audio_path,
+            _cache_params(language, min_speakers, max_speakers, diarize_mode),
         )
 
     # Fast path: a finished script for this exact input+params already exists.
@@ -897,7 +1871,7 @@ def run_pipeline(
         if need_diarize and (need_asr or need_aligned) and _parallel_diarize_enabled():
             log.info("[5/7] diarization running in parallel with ASR/alignment")
             diarize_future = _DIARIZE_POOL.submit(
-                _run_diarization, audio, min_speakers, max_speakers
+                _run_diarization, audio, min_speakers, max_speakers, diarize_mode
             )
 
         # 2. ASR ----------------------------------------------------------- #
@@ -983,6 +1957,7 @@ def run_pipeline(
                 payload = ckpt.load_json(_CKPT_DIARIZE)
                 if isinstance(payload, dict):
                     rows = payload["turns"]
+                    diarize_info = payload.get("diarization") or {}
                 else:
                     # Legacy bare-list checkpoint from before speaker linking:
                     # already labeled, and no centroids to relink against.
@@ -990,6 +1965,13 @@ def run_pipeline(
                         "[5/7] legacy diarize.json (pre-linking); keeping stored labels"
                     )
                     rows = payload
+                    diarize_info = {}
+                if diarize_info.get("strategy"):
+                    log.info(
+                        "[5/7] cache hit: diarization (strategy %s, mode %s)",
+                        diarize_info.get("strategy"),
+                        diarize_info.get("mode"),
+                    )
                 diarize_segments = pd.DataFrame(
                     rows, columns=["start", "end", "speaker"]
                 )
@@ -997,17 +1979,29 @@ def run_pipeline(
             if diarize_future is not None:
                 # Join the parallel diarization; re-raises any worker error
                 # here, after the ASR/alignment checkpoints were saved above.
-                diarize_segments, centroids, elapsed = diarize_future.result()
+                diarize_segments, centroids, elapsed, diarize_info = (
+                    diarize_future.result()
+                )
                 timings["diarize"] = round(elapsed, 3)
             else:
                 with _timed(timings, "diarize"):
-                    diarize_segments, centroids, _ = _run_diarization(
-                        audio, min_speakers, max_speakers
+                    diarize_segments, centroids, _, diarize_info = _run_diarization(
+                        audio, min_speakers, max_speakers, diarize_mode
                     )
             rows = _diarize_rows(diarize_segments)
             embeddings_out: dict[str, list[float]] = {}
-            if SPEAKER_LINKING:
-                if centroids:
+            if SPEAKER_LINKING and rows:
+                if diarize_info.get("strategy") == "fast" and centroids:
+                    # Fast-path rows already carry stable roster tags (that is
+                    # what was verified) -- nothing to relabel or allocate;
+                    # fold this run's centroids into the existing entries.
+                    link_t0 = time.perf_counter()
+                    embeddings_out = _refresh_enrolled(centroids, input_name)
+                    log.info(
+                        "[5/7] speaker refresh done in %.2fs",
+                        time.perf_counter() - link_t0,
+                    )
+                elif centroids:
                     link_t0 = time.perf_counter()
                     rows, embeddings_out = _link_speakers(rows, centroids, input_name)
                     log.info(
@@ -1021,6 +2015,7 @@ def run_pipeline(
             payload: dict = {"turns": rows}
             if SPEAKER_LINKING:
                 payload["embeddings"] = embeddings_out
+            payload["diarization"] = _jsonable(diarize_info)
             if ckpt:
                 ckpt.save_json(_CKPT_DIARIZE, payload)
             diarize_segments = pd.DataFrame(rows, columns=["start", "end", "speaker"])
@@ -1085,6 +2080,7 @@ async def transcribe_async(
     language: Optional[str] = None,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
+    diarize_mode: Optional[str] = None,
     resume: bool = RESUME,
 ) -> list[dict]:
     """Run the blocking pipeline in a worker thread so the loop stays responsive."""
@@ -1094,6 +2090,7 @@ async def transcribe_async(
         language=language,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        diarize_mode=diarize_mode,
         resume=resume,
     )
 
@@ -1113,9 +2110,14 @@ async def create_transcription_task(
     language: Optional[str] = None,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
+    diarize_mode: Optional[str] = None,
     resume: Optional[bool] = None,
 ) -> dict:
     """Accept an audio upload and kick off an asynchronous transcription job."""
+    try:
+        _diarize_mode(diarize_mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     task_id = uuid.uuid4().hex
     workdir = Path(tempfile.mkdtemp(prefix=f"tscript-{task_id}-"))
 
@@ -1131,7 +2133,13 @@ async def create_transcription_task(
         "error": None,
     }
     use_resume = RESUME if resume is None else resume
-    log.info("queued task %s (%s, resume=%s)", task_id, in_path.name, use_resume)
+    log.info(
+        "queued task %s (%s, resume=%s, diarize_mode=%s)",
+        task_id,
+        in_path.name,
+        use_resume,
+        _diarize_mode(diarize_mode),
+    )
 
     asyncio.create_task(
         _run_transcription_task(
@@ -1140,6 +2148,7 @@ async def create_transcription_task(
             language,
             min_speakers,
             max_speakers,
+            diarize_mode,
             workdir,
             use_resume,
         )
@@ -1153,6 +2162,7 @@ async def _run_transcription_task(
     language: Optional[str],
     min_speakers: Optional[int],
     max_speakers: Optional[int],
+    diarize_mode: Optional[str],
     workdir: Path,
     resume: bool,
 ) -> None:
@@ -1165,6 +2175,7 @@ async def _run_transcription_task(
             language=language,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
+            diarize_mode=diarize_mode,
             resume=resume,
         )
         task["status"] = "completed"
@@ -1205,6 +2216,7 @@ def cli_transcribe(args: argparse.Namespace) -> int:
         language=args.language,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
+        diarize_mode=args.diarize_mode,
         batch_size=args.batch_size,
         resume=RESUME and not args.no_resume,
     )
@@ -1251,6 +2263,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_transcribe.add_argument("--min-speakers", type=int, default=None)
     p_transcribe.add_argument("--max-speakers", type=int, default=None)
+    p_transcribe.add_argument(
+        "--diarize-mode",
+        choices=["fast", "auto", "pyannote"],
+        default=None,
+        help="Diarization strategy: 'fast' (VAD-window embeddings verified "
+        "against the speaker roster, escalates to full pyannote when it "
+        "cannot be trusted), 'auto' (fast, additionally escalating on weak "
+        "quality signals), or 'pyannote' (always the full pipeline). "
+        "Defaults to DIARIZE_MODE from the environment ('fast').",
+    )
     p_transcribe.add_argument(
         "--batch-size",
         type=int,

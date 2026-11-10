@@ -776,3 +776,76 @@ easy, still untested. (b) Boundary-refine acceptance = word-speaker
 agreement ≥99% vs current pipeline output on kelwin + perf-review + one
 new-voice file. (c) Only one kelwin recording exists — cross-file Kelwin
 re-identification is untestable until file #2.
+
+## 2026-11-10 — K2 SHIPPED: diarization strategy ladder (fast/auto/pyannote) — identity probe closes the quality gap to the exclusive-trace ceiling, gate renegotiated ceiling-relative
+
+Implementation per plan (`harmonic-watching-nova.md`): `DIARIZE_MODE`
+(default `fast`) / `--diarize-mode` / API `diarize_mode`; `diarize_mode` +
+`diarize_fast_*` added to the cache key (one-time invalidation, asr_backend
+precedent); `diarize.json` gains a `diarization` envelope
+`{strategy, mode, reasons, voices, windows, matches, low_margin_frac,
+refined{...}}` (legacy bare lists still read); bench forces
+`DIARIZE_MODE=pyannote` for historical comparability.
+
+**Ship-gate story — the important part.** Four failed improvement rounds
+(clustering rewrite, smoothing removal, soft voting, pyannote-style run
+reconstruction) plateaued at 96.6/92.5%. Diagnosis turned the picture:
+fast emitted 38 turns vs GT's 190 — whole 4–13s interjections swallowed
+(GT's 4.2s SPEAKER_01 turn 7.89–12.11 sat inside a 32s SPEAKER_00 run),
+and region inspection showed supervision going **backwards**: chunk
+[686,696] carried 9.9s of pure SPEAKER_01 (masked-crop cos 0.86)
+supervised as SPEAKER_00, because its covering 10s *window* straddled the
+boundary SPEAKER_00-majority. Window-level identity cannot see sub-window
+turns; iterated self-supervision is self-confirming and cannot escape.
+
+**The fix — identity probe (pyannote's own channel-identification
+mechanism, applied surgically).** After the first supervised channel→tag
+mapping in refinement, every channel carrying ≥1s of activation in a
+boundary-adjacent chunk (≥2 massy channels, or a massy unmapped one) gets
+its masked crop embedded and matched against the roster-verified cluster
+centroids at the join threshold (0.50); identity evidence overrides
+supervision (conflict → higher cosine wins). Gap-fill-only probing
+(unmapped channels) reached 97.5/96.9; probing mapped-but-suspect channels
+too reached the final numbers.
+
+| file | fast word-agree | exclusive ceiling | gap | diarize wall (vs pyannote) |
+|---|---|---|---|---|
+| minsuk-1-1 979s | **98.36%** | 98.36% | 0.00 | 21.3s vs 41.3s (1.9×) |
+| kelwin 3151s | **98.05%** | 98.62% | 0.57pt | 75.3s vs ~157s (2.1×) |
+| perf-review 1114s | escalates (T7: unknown voice, cos 0.510) | = pyannote by construction | — | — |
+
+**Ceiling measurement (the reason the gate changed).** Rasterizing the GT
+turns themselves into a per-frame dominant-speaker trace — perfect
+information, no model — and scoring it through the same reconstruction +
+word-majority gate gives 98.36/98.62%: an absolute ≥99% word-agreement gate
+is **unsatisfiable by any one-label-per-frame trace** on these files,
+because ~4% of words sit in genuine overlap spans (pyannote keeps
+overlapping turns; an exclusive trace must pick the dominant voice).
+100% of the ceiling's misses and essentially all of fast's are overlap
+words. The earlier "pyannote hop1.0 vs hop2.0 = 100%" floor was two
+overlap-capable runs agreeing with themselves — not evidence 99% was
+reachable. **User decision: gate is ceiling-relative — fast must land
+within 0.75pt of the exclusive ceiling (both files pass: 0.00 / 0.57).**
+
+Rejected along the way, with numbers: refinement substrate at hop 1.0
+(identical agreement at 2× substrate cost — the residual kelwin gap is
+cross-talk dominance-flip timing, not granularity); probe accept 0.58/0.65
+(worse — and note the accept threshold doubles as the window join
+threshold, so sweeping it perturbs clustering too); `_FAST_EMBED_MASS`
+0.6s (identical — short-channel misses were not the constraint); 3-window
+median smoothing on coarse labels (93.4→88.9%, actively harmful); hard
+argmax chunk voting (saturates ~4pt below soft mass voting).
+
+End-to-end wall-clock is **unchanged** in the default parallel layout —
+diarize is the smaller job either way and hides under ASR; the 1.9–2.1×
+stage win shows up in sequential mode and as headroom. Escalation wastes
+only the fast attempt (~15–40s/hour) and produces byte-identical pyannote
+output. Cost of the probe is the dominant fast-path expense (kelwin: 1502
+masked crops ≈ 30s of the 75s); trimming it via shorter crops or
+narrower probing rules was deferred — parallel mode hides it.
+
+Verified: escalation identity (T5 max_voices=1, T3 empty store, T7 s3
+stranger — correct reasons, pyannote output); determinism (two runs
+byte-identical, frozen store); cache invalidation + hit + envelope
+round-trip; sequential (`PARALLEL_STAGES=false`) and auto paths; CLI flag
++ argparse rejection; API 400 path; ruff clean.

@@ -148,6 +148,10 @@ def run_pipeline(snippet: Path, device: str, out_dir: Path) -> RunResult:
     # baseline file, so linking them would re-tag their voices with global
     # tags and make the report's speaker column incomparable.
     env["SPEAKER_LINKING"] = "false"
+    # Force the full pipeline: with linking off the fast ladder would never
+    # run anyway, but pin the mode so the diarize bucket stays comparable to
+    # the historical numbers regardless of the DIARIZE_MODE default.
+    env["DIARIZE_MODE"] = "pyannote"
 
     py = sys.executable
     cmd = [
