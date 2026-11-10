@@ -239,6 +239,14 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   vs turbo-MLX's 0.088 (same harness, same VAD chunks, same reference).
   Leaderboard parity does not transfer to our accented WebEx audio at any
   tested size; the transducer family is closed locally.
+- [~] **C3. Qwen3-ASR via `mlx-qwen3-asr`** — the last ASR-swap candidate
+  (2026-11-10 scan): first model smaller AND faster than turbo while
+  claiming higher WER; MLX-native, no torch, native word-timestamp aligner
+  (kills the align stage too) and native `--context` biasing. Spike 0.6B +
+  1.7B through the same WER harness + VAD chunks. Gate: WER ≤ turbo's 0.088
+  on BOTH eval files; prize: ~2-3× asr + align stage gone + L0 entity
+  biasing free. Prior guarded: 4 leaderboard families already failed our
+  gate — but none had an LLM decoder or this speed. → claude (2026-11-10)
 
 ### Speed — saturation probe (the gate before any runtime rewrite)
 
@@ -274,6 +282,31 @@ place. When you complete an item, tick it AND append a dated outcome entry.
   whisper's own DTW timestamps vs wav2vec2's; if accuracy holds, −20% wall
   (align is 86s/hour uncontended). QUALITY-GATED on timestamp accuracy, not
   WER. Cheap probe: compare word-time deltas on the 600s clip.
+  (Superseded by C3's native aligner if C3 lands; probe independently
+  otherwise.)
+- [ ] **K. Verification-based diarization (classify, don't cluster)** —
+  reuse the ASR path's VAD segments (already computed), one wespeaker
+  embedding per segment, cosine-match against the enrolled roster
+  (.speakers.json); escalate to the full pyannote path ONLY on no-match
+  (new voice), low margin, or overlap frames. Recurring meetings (the
+  actual workload) hit the fast path always; first file with a new voice
+  pays full diarize once. Est. diarize solo 24s → 4-8s @600s (one crop per
+  segment vs ~590 window-crops), contention tax → ~0. Gates: SpeakerAcc
+  ≥99% (word-speaker agreement harness), diarize wall −70%+, cold-start
+  fallback correct. Lit: TS-VAD+ (APSIPA'25), online target-speaker
+  tracking, Target Speaker Tagging benchmark 2026.
+- [ ] **L. Entity-resolution cascade (subsumes H)** — three layers,
+  cheapest first, all local, scored with the scoreboard (EntityAcc /
+  DamageRate / T1): L0 decode-time biasing (per-chunk initial_prompt on the
+  MLX path — our chunked calls bias EVERY chunk; faster-whisper `hotwords`
+  on ct2; Qwen3 `--context` if C3 lands; lit: up to 88% relative cut on
+  bias words). L1 deterministic post-resolve (glossary + fuzzy match +
+  speaker-conditioned variant clustering — amiria/amiru/ameer said BY the
+  same interlocutor link via our diarize tags; no LLM, milliseconds). L2
+  selective LLM correction (LFM on LM Studio ~50 tps; entity-bearing spans
+  only ≈ 30-90s/hour; must not run on the critical path; DamageRate gate
+  ~0). Output contract question for the user: is a two-tier artifact
+  (fast .md now, corrected .md shortly after) acceptable?
 - [x] **G. Faster/streaming diarizer** — SHIPPED 2026-11-08 (see entry below):
   segmentation hop 2.0s (`DIARIZE_SEG_STEP`) → diarize 2.0× solo, e2e −22%
   @600s, 100% final word-speaker agreement, linking intact. Remaining
@@ -282,8 +315,12 @@ place. When you complete an item, tick it AND append a dated outcome entry.
 
 ### Quality
 
-- [ ] **H. Hotwords / initial_prompt** for recurring product names + jargon —
-  zero speed cost, whisper-native; micro-test WER on jargon-dense spans.
+- [x] **H. Hotwords / initial_prompt** — folded into **L (L0)** 2026-11-10:
+  per-chunk initial_prompt on our MLX path biases every chunk (stock
+  whisper's first-30s-only limitation doesn't apply to chunked decoding);
+  faster-whisper `hotwords` covers the ct2 path; lit says up to 88% relative
+  bias-word WER cut at ~zero cost. Execute as part of L with the scoreboard
+  gates (global WER must not drift).
 - [ ] **I. Overlap recovery / separation** — marginal by measurement (0.4–7.2%
   of speech, file-dependent); stays behind the DER gate.
 - [ ] P(inf) native-audio entity linking — coolness factor only, do NOT chase.
@@ -544,3 +581,79 @@ this chip for open-weights ASR.** The answer to that target is hardware
 algorithms. Remaining local levers: J (native word timestamps, ~−20% wall,
 quality-gated), F (cue merge, needs user OK), Sortformer diarizer (residual
 contention), H (hotwords, quality).
+
+## 2026-11-10 — strategy scan: WisprFlow demystified, qwen3-asr found, the cascade architecture, and the scoreboard
+
+Comprehensive web scan (close-out of the "9× debate"), findings ranked by
+impact on OUR constraints:
+
+**1. NEW SPIKE CANDIDATE — `mlx-qwen3-asr` (moona3k), the first that is
+smaller AND faster than turbo while claiming higher WER.** Ground-up MLX
+reimplementation of Alibaba's Qwen3-ASR (audio encoder + small LLM decoder,
+LLM-style). No torch dependency (mlx/numpy/regex/hf-hub only). On M4 Pro:
+0.6B 4-bit RTF 0.018 (~55× RT), fp16 0.029; 1.7B fp16 2.4× slower, ~3.4GB.
+Repo's LibriSpeech: 0.6B 2.33% clean / 1.7B 1.94%; FLEURS 6.7-9.5%.
+Third-party (soniqo): 1.7B 5-bit 1.32% WER beating WhisperKit turbo 1.71%
+while 23% faster. Includes a NATIVE MLX forced aligner (word timestamps,
+~5.7ms MAE, 2.64× faster than official) and a `--context` flag
+(decode-time context/entity biasing) and even a `[diarize]` pyannote extra.
+Cautions: benchmarks are clean-audio; 4 leaderboard families already failed
+our accented WebEx gate (canary ×2, parakeet ×2) — the LLM decoder + far
+larger training corpus is the reason this one might transfer. → C3 opened.
+
+**2. WisprFlow is not on-device magic — it is the cascade pattern.** Their
+dictation = cloud ASR (own models, Baseten/AWS subprocessors) + LLM
+post-polish (fillers, punctuation, formatting). The borrowable idea for a
+local service: cheap decode → selective correction layer, where correction
+is display-tier and runs after the transcript exists. Open-source local
+imitators (VoiceInk, Handy, OpenTypeless BYOK, EnviousWispr) confirm the
+pattern but nobody matches the polish locally with big models.
+
+**3. GER (generative error correction) literature validates the corrector
+layer with known recipes and known risks.** HyPoradise (N-best→LLM,
+NeurIPS'23), Whispering-LLaMA (EMNLP'23); Interspeech 2025 shows SMALL
+local LLMs are the right size for rare-word (entity!) correction; Apple's
+"specialized correctors" paper is the counterpoint — LLM correction adds
+latency and hallucination risk, measure the DAMAGE it does to
+already-correct text, not just the fixes.
+
+**4. Decode-time biasing is a solved research problem with an 88% number.**
+faster-whisper has `hotwords` (flaky after PR#856); whisper's
+initial_prompt only biases the FIRST 30s window in stock usage (context is
+evicted by rolling transcript) — but OUR MLX path calls transcribe per 30s
+VAD chunk, so a prompt passed per chunk biases EVERY chunk. Contextual
+biasing literature: up to 88% relative WER cut on bias words, others
+largely unaffected. Qwen3-ASR has `--context` natively. → L0 of the entity
+cascade.
+
+**5. Verification-based diarization (classify-against-roster, not
+cluster-from-scratch) is established**: TS-VAD+ (APSIPA 2025), online
+target-speaker tracking (arXiv 2310.08696), Target Speaker Tagging
+benchmark (2026). Our speaker-memory already holds the centroids; the VAD
+segments are already computed for ASR chunking. Overlap-only refinement is
+the ESCALATION trigger, not the base path (overlap is 7.2% of speech; the
+cost is the whole-file embedding flood, not the overlaps). → K opened.
+
+**6. TTS reference (not in the service today, recorded for completeness):**
+local 2026 consensus = Kokoro-82M via MLX (tiny, real-time+ on CPU/CoreML,
+quality sweet spot); Qwen3-TTS 1.7B for top quality/cloning; Piper for
+minimal footprint. All fit 16GB trivially.
+
+**7. Corrector sizing math (local LLM, LM Studio LFM ~50 tps):** full
+hour-transcript correction ≈ 12-15k tokens ≈ 4-5 min — does NOT fit the
+critical path; selective (entity-bearing spans only, ~10-20% of sentences)
+≈ 30-90s post-pipeline — fits as a second-tier artifact. Two-latency
+accounting required (T0 fast transcript, T1 corrected transcript).
+
+**The scoreboard (standard for all approximation/cascade experiments —
+apples-to-apples on the same eval files):**
+- T0 = wall to first complete artifact; T1 = wall to corrected artifact
+- WER_raw / WER_corr (existing same-harness rule, turbo control anchored)
+- EntityAcc = % correct occurrences of a hand-listed entity set
+  (names + product terms) per layer; DamageRate = share of already-correct
+  words changed by a corrector (target ~0)
+- SpeakerAcc = word-speaker agreement (existing harness)
+- Pareto gate: a layer ships only if its target metric improves with NO
+  regression beyond noise on every other axis; "fast+selective" beats
+  "correct-everywhere" iff equal EntityAcc/WER at lower T1 or better
+  EntityAcc at equal T1.
