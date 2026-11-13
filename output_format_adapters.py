@@ -2,7 +2,9 @@
 
 A *script* is the list of segment dicts produced by ``transcribe.run_pipeline``::
 
-    [{"time": {"start": float, "end": float}, "speaker": str, "text": str}, ...]
+    [{"time": {"start": float, "end": float}, "speaker": str | None, "text": str}, ...]
+
+A ``speaker`` of ``None`` (``--no-diarize`` runs) omits the speaker label.
 
 Supported formats
 -----------------
@@ -74,11 +76,12 @@ def _ensure_extension(path: Path, fmt: str) -> Path:
 def _render_md(script: list[dict]) -> str:
     lines: list[str] = ["# Transcript", ""]
     for seg in script:
-        speaker = seg.get("speaker") or "UNKNOWN"
+        speaker = seg.get("speaker")
         start = _format_timestamp(seg["time"]["start"])
         end = _format_timestamp(seg["time"]["end"])
         text = (seg.get("text") or "").strip()
-        lines.append(f"**[{start} → {end}] {speaker}**")
+        label = f" {speaker}" if speaker else ""
+        lines.append(f"**[{start} → {end}]{label}**")
         lines.append(text)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
@@ -87,13 +90,13 @@ def _render_md(script: list[dict]) -> str:
 def _render_vtt(script: list[dict]) -> str:
     lines: list[str] = ["WEBVTT", ""]
     for idx, seg in enumerate(script, start=1):
-        speaker = seg.get("speaker") or "UNKNOWN"
+        speaker = seg.get("speaker")
         start = _format_timestamp(seg["time"]["start"])
         end = _format_timestamp(seg["time"]["end"])
         text = (seg.get("text") or "").strip()
         lines.append(str(idx))
         lines.append(f"{start} --> {end}")
-        lines.append(f"<v {speaker}>{text}")
+        lines.append(f"<v {speaker}>{text}" if speaker else text)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

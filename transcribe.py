@@ -345,7 +345,8 @@ def convert_to_mp3(
 #                     "embeddings": {tag: centroid},
 #                     "diarization": {strategy, mode, reasons, ...}} -- the
 #                     embeddings/diarization halves are present only when
-#                     speaker linking is on / the strategy ladder ran
+#                     speaker linking is on / the strategy ladder ran; the
+#                     whole file is absent when diarization was skipped
 #   final.json        [6] result after speaker assignment
 #   script.json       [7] the final clean script
 _CKPT_AUDIO = "converted.mp3"
@@ -370,6 +371,7 @@ def _cache_params(
     min_speakers: Optional[int],
     max_speakers: Optional[int],
     diarize_mode: Optional[str] = None,
+    diarize: bool = True,
 ) -> dict:
     """Params that change a stage's output -> part of the cache key.
 
@@ -397,6 +399,8 @@ def _cache_params(
         # max_flip) are excluded: they never change a *successful* fast
         # output, only whether fast is attempted/kept.
         "diarize_mode": _diarize_mode(diarize_mode),
+        # A no-diarize run writes a speaker-less script -> separate cache entry.
+        "diarize": diarize,
         "diarize_fast_max_voices": DIARIZE_FAST_MAX_VOICES,
         "diarize_fast_cluster_threshold": DIARIZE_FAST_CLUSTER_THRESHOLD,
         "diarize_fast_merge_threshold": DIARIZE_FAST_MERGE_THRESHOLD,
@@ -1784,6 +1788,7 @@ def run_pipeline(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     diarize_mode: Optional[str] = None,
+    diarize: bool = True,
     batch_size: int = BATCH_SIZE,
     resume: bool = RESUME,
 ) -> list[dict]:
@@ -1802,6 +1807,10 @@ def run_pipeline(
       6. assign speakers to segments
       7. shape into ``[{"time": {"start", "end"}, "speaker", "text"}, ...]``
 
+    ``diarize=False`` (``--no-diarize`` / ``?diarize=false``) skips stages 5-6
+    entirely -- transcription and word alignment only, no ``HF_TOKEN`` needed,
+    and the script's ``speaker`` fields are ``None``.
+
     When ``resume`` is true (default; toggle with ``RESUME``) every stage's
     output is checkpointed under ``CHECKPOINT_DIR`` keyed by the input's content
     hash + params, so a re-run on the same file resumes from the last completed
@@ -1815,7 +1824,7 @@ def run_pipeline(
     if resume:
         ckpt = Checkpoint.open(
             audio_path,
-            _cache_params(language, min_speakers, max_speakers, diarize_mode),
+            _cache_params(language, min_speakers, max_speakers, diarize_mode, diarize),
         )
 
     # Fast path: a finished script for this exact input+params already exists.
@@ -1857,7 +1866,7 @@ def run_pipeline(
         # What still needs computing? (a cache hit skips that stage.)
         need_asr = not (ckpt and ckpt.has(_CKPT_ASR))
         need_aligned = not (ckpt and ckpt.has(_CKPT_ALIGNED))
-        need_diarize = not (ckpt and ckpt.has(_CKPT_DIARIZE))
+        need_diarize = diarize and not (ckpt and ckpt.has(_CKPT_DIARIZE))
 
         # ASR, alignment and diarization all consume the same 16 kHz waveform;
         # load it once up front.
@@ -1951,7 +1960,9 @@ def run_pipeline(
                 ckpt.save_json(_CKPT_ALIGNED, result)
 
         # 5. diarization --------------------------------------------------- #
-        if not need_diarize:
+        if not diarize:
+            log.info("[5/7] diarization skipped (--no-diarize)")
+        elif not need_diarize:
             log.info("[5/7] cache hit: diarization")
             with _timed(timings, "diarize"):
                 payload = ckpt.load_json(_CKPT_DIARIZE)
@@ -2021,16 +2032,19 @@ def run_pipeline(
             diarize_segments = pd.DataFrame(rows, columns=["start", "end", "speaker"])
 
         # 6. assign speakers ----------------------------------------------- #
-        log.info("[6/7] assigning speakers to segments")
-        with _timed(timings, "assign"):
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+        if diarize:
+            log.info("[6/7] assigning speakers to segments")
+            with _timed(timings, "assign"):
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+        else:
+            log.info("[6/7] speaker assignment skipped (--no-diarize)")
         if ckpt:
             ckpt.save_json(_CKPT_FINAL, result)
 
         # 7. build the clean script payload -------------------------------- #
         log.info("[7/7] building script payload")
         with _timed(timings, "build"):
-            script = build_script(result)
+            script = build_script(result, with_speakers=diarize)
         if ckpt:
             ckpt.save_json(_CKPT_SCRIPT, script)
             ckpt.record(status="completed", timings=timings)
@@ -2053,8 +2067,12 @@ def run_pipeline(
             shutil.rmtree(convert_dir, ignore_errors=True)
 
 
-def build_script(result: dict) -> list[dict]:
-    """Turn a WhisperX result into ``[{"time", "speaker", "text"}, ...]``."""
+def build_script(result: dict, with_speakers: bool = True) -> list[dict]:
+    """Turn a WhisperX result into ``[{"time", "speaker", "text"}, ...]``.
+
+    ``with_speakers=False`` (``--no-diarize``) leaves ``speaker`` as ``None``
+    for every segment; renderers then omit the speaker labels.
+    """
     segments = result["segments"] if isinstance(result, dict) else result.segments
     script: list[dict] = []
     for seg in segments:
@@ -2064,7 +2082,7 @@ def build_script(result: dict) -> list[dict]:
         script.append(
             {
                 "time": {"start": round(start, 3), "end": round(end, 3)},
-                "speaker": seg.get("speaker") or "UNKNOWN",
+                "speaker": (seg.get("speaker") or "UNKNOWN") if with_speakers else None,
                 "text": text,
             }
         )
@@ -2081,6 +2099,7 @@ async def transcribe_async(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     diarize_mode: Optional[str] = None,
+    diarize: bool = True,
     resume: bool = RESUME,
 ) -> list[dict]:
     """Run the blocking pipeline in a worker thread so the loop stays responsive."""
@@ -2091,6 +2110,7 @@ async def transcribe_async(
         min_speakers=min_speakers,
         max_speakers=max_speakers,
         diarize_mode=diarize_mode,
+        diarize=diarize,
         resume=resume,
     )
 
@@ -2111,6 +2131,7 @@ async def create_transcription_task(
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
     diarize_mode: Optional[str] = None,
+    diarize: Optional[bool] = None,
     resume: Optional[bool] = None,
 ) -> dict:
     """Accept an audio upload and kick off an asynchronous transcription job."""
@@ -2133,11 +2154,13 @@ async def create_transcription_task(
         "error": None,
     }
     use_resume = RESUME if resume is None else resume
+    use_diarize = True if diarize is None else diarize
     log.info(
-        "queued task %s (%s, resume=%s, diarize_mode=%s)",
+        "queued task %s (%s, resume=%s, diarize=%s, diarize_mode=%s)",
         task_id,
         in_path.name,
         use_resume,
+        use_diarize,
         _diarize_mode(diarize_mode),
     )
 
@@ -2149,6 +2172,7 @@ async def create_transcription_task(
             min_speakers,
             max_speakers,
             diarize_mode,
+            use_diarize,
             workdir,
             use_resume,
         )
@@ -2163,6 +2187,7 @@ async def _run_transcription_task(
     min_speakers: Optional[int],
     max_speakers: Optional[int],
     diarize_mode: Optional[str],
+    diarize: bool,
     workdir: Path,
     resume: bool,
 ) -> None:
@@ -2176,6 +2201,7 @@ async def _run_transcription_task(
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             diarize_mode=diarize_mode,
+            diarize=diarize,
             resume=resume,
         )
         task["status"] = "completed"
@@ -2211,12 +2237,19 @@ def cli_transcribe(args: argparse.Namespace) -> int:
         log.error("audio file not found: %s", args.file)
         return 1
 
+    if args.no_diarize and (
+        args.diarize_mode or args.min_speakers or args.max_speakers
+    ):
+        log.warning(
+            "--no-diarize set; ignoring --diarize-mode/--min-speakers/--max-speakers"
+        )
     script = run_pipeline(
         str(in_path),
         language=args.language,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
         diarize_mode=args.diarize_mode,
+        diarize=not args.no_diarize,
         batch_size=args.batch_size,
         resume=RESUME and not args.no_resume,
     )
@@ -2272,6 +2305,13 @@ def build_parser() -> argparse.ArgumentParser:
         "cannot be trusted), 'auto' (fast, additionally escalating on weak "
         "quality signals), or 'pyannote' (always the full pipeline). "
         "Defaults to DIARIZE_MODE from the environment ('fast').",
+    )
+    p_transcribe.add_argument(
+        "--no-diarize",
+        action="store_true",
+        help="Skip speaker diarization entirely: transcription + word "
+        "timestamps only, no speaker labels (and no HF_TOKEN needed). "
+        "Ignores --diarize-mode/--min-speakers/--max-speakers.",
     )
     p_transcribe.add_argument(
         "--batch-size",
