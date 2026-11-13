@@ -2,20 +2,88 @@
 
 # scribe-lite : a speech-to-text transcription-service
 
-Single-file speech-to-text service built on [WhisperX](https://github.com/m-bain/whisperX) for long-form audio. No Docker — a sequential pipeline that transcribes, aligns, diarizes and produces a clean speaker script, exposed through a CLI and an async HTTP API.
+Single-file speech-to-text service built on [WhisperX](https://github.com/m-bain/whisperX) for long-form audio. No Docker — a checkpointed pipeline that transcribes, aligns, diarizes and produces a clean speaker script, exposed through a CLI and an async HTTP API.
 
-Everything lives in [`transcribe.py`](transcribe.py), plus [`output_format_adapters.py`](output_format_adapters.py) for rendering the script to `.md` / `.vtt`. All settings are read from a `.env` file via `load_dotenv()`.
+Everything lives in [`transcribe.py`](transcribe.py), plus [`output_format_adapters.py`](output_format_adapters.py) for rendering the script to `.md` / `.vtt`. All settings are read from a `.env` file via `load_dotenv()` — copy the committed [`.env.example`](.env.example) and set `HF_TOKEN` to get running (see [Get started](#get-started-fresh-clone)).
 
 ## Project layout
 
 ```
 transcribe.py                  # engine + CLI + HTTP API
 output_format_adapters.py      # md / vtt renderers + save()
-.env                            # all configuration
-Data/                           # default input audio location
-Output/                         # default transcription output location (created on demand)
+.env.example                   # configuration template (copy to .env)
+.env                           # your configuration (gitignored, holds HF_TOKEN)
+Data/                          # default input audio location (gitignored)
+Output/                        # default transcription output location (created on demand)
 .transcribe_cache/             # resume checkpoints (gitignored, created on demand)
+.speakers.json                 # speaker memory (gitignored, created on demand)
 ```
+
+## Get started (fresh clone)
+
+**Prerequisites** — macOS on Apple Silicon is where this is built and tuned
+(the MLX ASR backend needs it); see the platform note below for elsewhere.
+You need [`uv`](https://docs.astral.sh/uv/) and **ffmpeg** on your PATH:
+
+```bash
+brew install uv ffmpeg          # or: curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+You also need **Hugging Face access to the diarization model** — it is
+[gated](https://huggingface.co/pyannote/speaker-diarization-community-1), so
+do this before your first run:
+
+1. Open the [model page](https://huggingface.co/pyannote/speaker-diarization-community-1)
+   and accept the **user conditions** (button near the top).
+2. Create a read access token at <https://huggingface.co/settings/tokens>.
+
+Then, from a fresh clone:
+
+```bash
+# 1. install dependencies (uv creates the venv and fetches Python 3.12 if
+#    the machine doesn't have it): fastapi, uvicorn, whisperx, mlx-whisper, ...
+uv sync
+
+# 2. create your .env from the template and paste the token into HF_TOKEN
+cp .env.example .env
+$EDITOR .env
+
+# 3. transcribe an audio file (any container: m4a, mp3, wav, ogg, flac, ...)
+#    -- a bare filename is looked up under ./Data
+mkdir -p Data && cp ~/Desktop/meeting.m4a Data/
+uv run python3 transcribe.py transcribe meeting.m4a
+#    -> ./Output/meeting.md     (progress logged as [1/7]..[7/7])
+
+# 4. ...or serve the HTTP API
+uv run python3 transcribe.py serve          # http://localhost:8000/docs
+```
+
+Notes for the first run:
+
+- **Model downloads are one-time** — whisper `large-v3-turbo` (MLX), the
+  wav2vec2 alignment model, and the pyannote diarization pipeline are fetched
+  from Hugging Face on first use (a few GB total; cached under
+  `~/.cache/huggingface`). The first transcription is slower because of this.
+- **`HF_TOKEN` must be valid before step 3** or diarization fails with
+  `401`/`403`. If a sub-model 401s, open its model page and accept its
+  conditions too. Thanks to checkpointing, fixing the token and re-running
+  **resumes from the last completed stage** — no re-transcription.
+- `.env` is gitignored on purpose (it holds the token). The full, annotated
+  variable list lives in [`.env.example`](.env.example); the tuning reference
+  is "Config (`.env`)" under [Performance & device strategy](#performance--device-strategy).
+- Runtime artifacts (`Output/`, `.transcribe_cache/`, `.speakers.json`) are
+  all gitignored and safe to delete — see
+  [Resume & checkpointing](#resume--checkpointing) and
+  [Speaker memory](#speaker-memory-stable-speaker-tags).
+
+> **Other platforms:** MLX ASR needs macOS + Apple Silicon; elsewhere
+> `ASR_BACKEND=auto` falls back to the ct2 CPU backend by itself (force it
+> with `ASR_BACKEND=ct2`), and a CUDA GPU can drive the PyTorch stages with
+> `DEVICE=cuda`. Everything is tuned and benchmarked on a base M2 (16 GB);
+> with the defaults nothing needs configuring beyond `HF_TOKEN`.
+
+Developing: `uvx pre-commit install` wires the gitleaks + ruff hook into
+`.git/hooks` (what CI-style hygiene this repo runs locally on commit).
 
 ## Pipeline
 
@@ -94,8 +162,9 @@ save(script: list[dict], path: str | Path, fmt: str | None = None) -> Path
 **HTTP API** (`serve`):
 
 ```python
-POST /transcribe/async/   # multipart: file (required), language?, min_speakers?, max_speakers?,
-                          #          diarize_mode? ("fast"|"auto"|"pyannote", else 400), resume?
+POST /transcribe/async/   # multipart body: file (required)
+                          # query params: language?, min_speakers?, max_speakers?,
+                          #   diarize_mode? ("fast"|"auto"|"pyannote", else 400), resume?
                           # -> {"task_id": "<hex>", "status": "pending"}
 GET  /tasks/{task_id}     # -> {"task_id", "status": "pending|processing|completed|failed",
                           #     "created_at", "result": <script> | None, "error": str | None}
@@ -195,7 +264,11 @@ similarity **and word error rate**. WER is the metric to watch when comparing
 across ASR backends — char similarity collapses when decoder styles differ
 (fillers, punctuation) even when the words are the same. Set `ASR_BACKEND=ct2`
 in the environment to bench the fallback backend head-to-head. Snippets are
-created on demand in `Data/` from `s3-and-research.opus`.
+created on demand in `Data/` from `s3-and-research.opus` — **a maintainer
+tool**: the source file and its baseline transcript are local-only (`Data/` is
+gitignored). To reuse the harness on your own recording, transcribe the full
+file once and point the `SNIPPET_SOURCE` / `BASELINE_VTT` constants at the top
+of the script at it.
 
 ```bash
 uv run python3 benchmarks/bench_transcribe.py                 # default matrix
@@ -315,65 +388,6 @@ one-time invalidation the ASR-backend switch had).
 - Disable globally with `RESUME=false` in `.env`.
 - Wipe the cache any time: `rm -rf .transcribe_cache`.
 
-## Prerequisites
-
-- Python ≥ 3.12
-- [`uv`](https://docs.astral.sh/uv/) (used to manage the venv)
-- **ffmpeg** on your PATH — `brew install ffmpeg`
-- **Hugging Face access to the diarization model.** The pipeline uses
-  [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1),
-  which is **gated**. Do this **first**, before running anything:
-
-  1. Open the [model page](https://huggingface.co/pyannote/speaker-diarization-community-1)
-     and accept the **user conditions** (button near the top).
-  2. Create a read access token at [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
-  3. Put it in `.env` as `HF_TOKEN=hf_xxx`.
-
-  > If diarization later 401/403s on a sub-model, open that model's page and
-  > accept its conditions too — but the main repo above is the required one.
-  >
-
-  Skip step 1/2 and diarization fails with a `401`/`403`. Thanks to the
-  checkpointing below, you can fix the token and **resume from the last
-  completed stage** — no re-transcription needed.
-
-## Setup
-
-```bash
-# install dependencies (fastapi, uvicorn, whisperx, python-multipart, python-dotenv)
-uv sync
-```
-
-Create a `.env` (already present — edit to taste):
-
-```dotenv
-HF_TOKEN=hf_xxx               # required for diarization
-TRANSCRIPTION_MODEL=large-v3-turbo
-DEVICE=mps                    # cpu | cuda | mps (align + diarize)
-ASR_BACKEND=auto              # mlx | ct2 | auto (auto = mlx on Apple Silicon)
-MLX_MODEL=                    # explicit MLX repo (default: mapped from TRANSCRIPTION_MODEL)
-ASR_DEVICE=cpu                # ct2 backend only (faster-whisper has no MPS)
-ASR_THREADS=8                 # ct2 backend only
-COMPUTE_TYPE=int8             # ct2 backend only
-PARALLEL_STAGES=auto          # diarization ∥ ASR+alignment (true | false | auto)
-DIARIZE_SEG_STEP=2.0          # diarization window hop in s; 1.0 = upstream behavior
-SPEAKER_LINKING=true          # stable speaker tags across files (delete .speakers.json to reset)
-BATCH_SIZE=8                  # ct2 backend only; smaller = less memory
-HOST=0.0.0.0
-PORT=8000
-DATA_DIR=Data                 # default input audio directory
-OUTPUT_DIR=Output             # default output directory
-DEFAULT_OUTPUT_FORMAT=md      # md | vtt  (used when --format and the -o suffix are absent)
-RESUME=true                   # checkpoint each stage; re-runs resume from last success
-CHECKPOINT_DIR=.transcribe_cache   # where checkpoints live (gitignored)
-DIARIZE_MODEL=                # override diarization model (default: pyannote/speaker-diarization-community-1)
-DIARIZE_MODE=fast             # diarization strategy: fast | auto | pyannote (see ladder section)
-```
-
-> **Device / compute type note:** `int8` quantization is a CUDA-only path in
-> faster-whisper. On Apple Silicon (`DEVICE=mps`) use `COMPUTE_TYPE=float16`
-> (or `default`); on CPU use `int8` (CPU int8) or `default`.
-
 ## CLI (local files)
 
 Input audio is resolved as: an explicit path, or a bare filename looked up under
@@ -381,21 +395,21 @@ Input audio is resolved as: an explicit path, or a bare filename looked up under
 
 ```bash
 # transcribe ./Data/meeting.m4a -> ./Output/meeting.md (default format)
-uv run python transcribe.py transcribe meeting.m4a
+uv run python3 transcribe.py transcribe meeting.m4a
 
 # force WebVTT
-uv run python transcribe.py transcribe meeting.m4a --format vtt      # -> ./Output/meeting.vtt
+uv run python3 transcribe.py transcribe meeting.m4a --format vtt      # -> ./Output/meeting.vtt
 
 # full options
-uv run python transcribe.py transcribe /abs/path/audio.mp3 \
+uv run python3 transcribe.py transcribe /abs/path/audio.mp3 \
     --language en --min-speakers 2 --max-speakers 4 --diarize-mode auto \
     --batch-size 8 --format md --output notes.md
 
 # dump the raw JSON script to stdout instead of a formatted file
-uv run python transcribe.py transcribe meeting.m4a --json
+uv run python3 transcribe.py transcribe meeting.m4a --json
 
 # ignore saved checkpoints and run the full pipeline from scratch
-uv run python transcribe.py transcribe meeting.m4a --no-resume
+uv run python3 transcribe.py transcribe meeting.m4a --no-resume
 ```
 
 ### Output formats (`output_format_adapters.py`)
@@ -444,8 +458,8 @@ Raw JSON shape (one entry per segment):
 Start the server:
 
 ```bash
-uv run python transcribe.py serve                 # uses HOST/PORT from .env
-uv run python transcribe.py serve --port 8000      # override
+uv run python3 transcribe.py serve                 # uses HOST/PORT from .env
+uv run python3 transcribe.py serve --port 8000      # override
 ```
 
 Interactive docs are at `http://localhost:8000/docs`.
@@ -456,13 +470,14 @@ Upload an audio file (multipart). Returns a `task_id` immediately and runs the
 pipeline in the background.
 
 ```bash
-curl -X POST http://localhost:8000/transcribe/async/ \
-    -F "file=@path/to/audio.mp3" \
-    -F "min_speakers=2" -F "max_speakers=4"
+curl -X POST "http://localhost:8000/transcribe/async/?min_speakers=2&max_speakers=4" \
+    -F "file=@path/to/audio.mp3"
 # -> { "task_id": "b1c2...d4", "status": "pending" }
 ```
 
-Query params (all optional): `language`, `min_speakers`, `max_speakers`.
+Query params (all optional): `language`, `min_speakers`, `max_speakers`,
+`diarize_mode` (`fast` | `auto` | `pyannote`; anything else is a 400),
+`resume` (`false` = ignore checkpoints).
 
 ### `GET /tasks/{task_id}`
 
