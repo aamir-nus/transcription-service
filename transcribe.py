@@ -1,21 +1,8 @@
 """Single-file speech transcription service.
 
-Wraps WhisperX into a sequential pipeline (transcribe -> align -> diarize -> script)
-that loads and frees each model in turn to keep memory usage flat, and exposes it
-through three front-ends:
-
-  * ``run_pipeline``        -- the synchronous engine core
-  * ``transcribe_async``    -- an async worker that runs the core off the event loop
-  * FastAPI app             -- POST /transcribe/async/ + GET /tasks/{task_id}
-  * CLI                     -- ``python transcribe.py transcribe <file>``
-
-Run ``python transcribe.py serve`` to start the HTTP API.
-
-Each stage of the pipeline is checkpointed (keyed by the input file's content
-hash + params), so a failed run resumes from the last successful stage instead
-of starting over. Per-stage and total wall-clock timings are logged.
-
-All configuration is read from environment variables (see .env).
+Wraps WhisperX into a checkpointed pipeline (transcribe -> align -> diarize ->
+script), exposed through a CLI and an async HTTP API. Configuration comes from
+environment variables / .env (see .env.example).
 """
 
 import argparse
@@ -40,16 +27,11 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Load .env as defaults, but let an explicit shell/exported var win. This keeps
-# config-overridable-from-the-environment (e.g. the benchmark can force
-# DEVICE=cpu per run) while still picking up .env changes without a reinstall.
+# .env provides defaults; explicit environment variables win (benchmarks rely on this).
 load_dotenv(override=False)
 
-# pyannote hard-imports torchcodec and warns noisily when its native lib fails to
-# load (the wheel can't resolve Homebrew's FFmpeg dylibs on macOS, and brew's
-# ffmpeg 8 is newer than torchcodec 0.7's supported FFmpeg 4-7). Harmless here:
-# WhisperX always hands diarization an in-memory waveform dict, so pyannote's
-# torchcodec-based *file* decoding is never exercised. Silence just this warning.
+# pyannote's torchcodec warning is harmless here (diarization only ever receives
+# in-memory waveforms, never files) -- see CLAUDE.md before "fixing" it.
 warnings.filterwarnings(
     "ignore",
     message=r"\s*torchcodec is not installed correctly.*",
@@ -72,9 +54,7 @@ from output_format_adapters import (  # noqa: E402
     save as save_transcript,
 )
 
-# --------------------------------------------------------------------------- #
-# Configuration (all from the environment)
-# --------------------------------------------------------------------------- #
+# --- Configuration (all from the environment) ---
 HF_TOKEN: Optional[str] = os.getenv(
     "HF_TOKEN"
 )  # required for the gated diarization model
@@ -84,12 +64,7 @@ BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "8"))
 
 
 def _resolve_device(preferred: Optional[str]) -> str:
-    """Map 'auto'/None to the best available accelerator; honor explicit names.
-
-    Used for the pure-PyTorch stages (alignment + diarization), which DO benefit
-    from MPS on Apple Silicon. ASR is separate (see ASR_DEVICE): faster-whisper
-    (CTranslate2) has no Metal/MPS backend, so it is always CPU-bound.
-    """
+    """Map 'auto'/None to the best accelerator (for the PyTorch stages); honor explicit names."""
     if preferred and preferred.lower() != "auto":
         return preferred.lower()
     if torch.cuda.is_available():
@@ -99,26 +74,18 @@ def _resolve_device(preferred: Optional[str]) -> str:
     return "cpu"
 
 
-# PyTorch stages (align + diarize): MPS when available. Default 'auto' picks the
-# best accelerator; set DEVICE=cpu to force the old slow path for debugging.
+# PyTorch stages (align + diarize); 'auto' -> best accelerator.
 PIPELINE_DEVICE: str = _resolve_device(os.getenv("DEVICE", "auto"))
-# ASR stage: two interchangeable backends.
-#   'mlx' -> MLX whisper on the Apple GPU (Metal, fp16) -- several times faster
-#            than CPU int8 on Apple Silicon, same model weights.
-#   'ct2' -> faster-whisper/CTranslate2 (ASR_DEVICE, COMPUTE_TYPE, ASR_THREADS).
-# 'auto' prefers MLX when the package is importable and the configured model has
-# a known MLX conversion; otherwise it falls back to ct2.
+# ASR backend: 'mlx' (Apple GPU) | 'ct2' (CPU) | 'auto' -> mlx when importable
+# and the model has a known conversion, else ct2.
 ASR_BACKEND: str = (os.getenv("ASR_BACKEND") or "auto").lower()
 ASR_DEVICE: str = (os.getenv("ASR_DEVICE") or "cpu").lower()
-# faster-whisper CPU thread count (ct2 backend only). whisperx defaults to 4,
-# which leaves cores idle; default to all logical cores.
+# ct2 only; whisperx defaults to 4, which leaves cores idle.
 ASR_THREADS: int = int(os.getenv("ASR_THREADS", str(max(1, os.cpu_count() or 4))))
 # Optional explicit MLX repo id (default: mapped from TRANSCRIPTION_MODEL below).
 MLX_MODEL: Optional[str] = os.getenv("MLX_MODEL") or None
 
-# Known MLX (mlx-community) conversions of the whisperx model names. An
-# unmapped TRANSCRIPTION_MODEL with no MLX_MODEL override makes 'auto' fall
-# back to ct2 rather than guess at a conversion.
+# Known mlx-community conversions; an unmapped model with no MLX_MODEL -> ct2.
 _MLX_MODEL_REPOS = {
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
     "large-v3": "mlx-community/whisper-large-v3-mlx",
@@ -157,55 +124,34 @@ DATA_DIR: Path = Path(os.getenv("DATA_DIR", "Data"))
 OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", "Output"))
 DEFAULT_OUTPUT_FORMAT: str = os.getenv("DEFAULT_OUTPUT_FORMAT", "md")
 
-# Resume / checkpointing. Each expensive stage is cached under CHECKPOINT_DIR in
-# a folder keyed by the input file's content hash + params; re-running the same
-# file resumes from the last completed stage instead of starting over.
+# Resume / checkpointing (see Checkpoint below).
 RESUME: bool = os.getenv("RESUME", "true").lower() in {"1", "true", "yes", "on"}
 CHECKPOINT_DIR: Path = Path(os.getenv("CHECKPOINT_DIR", ".transcribe_cache"))
 DIARIZE_MODEL: Optional[str] = os.getenv("DIARIZE_MODEL") or None
-# Segmentation window hop in seconds (default 2.0). The hop controls how many
-# overlapping 10s windows (and therefore per-speaker embedding crops) the
-# diarizer processes: the default upstream 1.0s hop costs 2x the wall-clock
-# for ~1.6% frame-level speaker changes on our eval audio. 1.0 restores
-# upstream behavior exactly; see OPTIMIZATION_LOG.md.
+# Segmentation hop (s): 2.0 halves embedding crops vs upstream 1.0; 1.0 = upstream.
 DIARIZE_SEG_STEP: float = float(os.getenv("DIARIZE_SEG_STEP", "2.0"))
-# Diarization strategy ladder (see _diarize_mode). 'pyannote' = always the full
-# pipeline. 'fast' (default) = embed VAD windows with the diarizer's own
-# embedding model, cluster them, and verify the file's voice centroids against
-# the speaker roster; escalate to full pyannote only when that is impossible
-# (unknown voice, too many voices, empty roster, clustering failure). 'auto'
-# additionally escalates on weak quality signals (low per-window margin).
+# Diarization strategy ladder -- 'fast' (default) | 'auto' | 'pyannote' (see _diarize_mode).
 DIARIZE_MODE: str = (os.getenv("DIARIZE_MODE") or "fast").lower()
-# Fast path: escalate to full pyannote when clustering finds more voices than
-# this (the K probe validated 2-3 voice files; clustering gets shakier as
-# voices grow).
+# Fast path: escalate when clustering finds more than this many voices.
 DIARIZE_FAST_MAX_VOICES: int = int(os.getenv("DIARIZE_FAST_MAX_VOICES", "4"))
-# Fast path: greedy clustering cosine threshold (probe measured intra-cluster
-# ~0.9 vs inter-cluster <=0.45 -- 0.5 sits in the canyon).
+# Fast path: greedy clustering cosine cutoff (intra-cluster ~0.9 vs inter <=0.45).
 DIARIZE_FAST_CLUSTER_THRESHOLD: float = float(
     os.getenv("DIARIZE_FAST_CLUSTER_THRESHOLD", "0.50")
 )
-# Fast path: centroid-level merge threshold. One voice can split into several
-# clusters when its acoustic mode shifts mid-file (mic change, channel drift);
-# such fragments measured >=0.71 centroid cosine to their main cluster while
-# different voices stayed <=0.51 on the same file. 0.65 sits in that canyon,
-# biased toward NOT merging distinct voices (a missed merge only escalates to
-# full pyannote; a wrong merge silently loses a speaker).
+# Fast path: centroid merge cutoff, biased against merging -- a missed merge
+# only escalates to pyannote, a wrong merge silently loses a speaker.
 DIARIZE_FAST_MERGE_THRESHOLD: float = float(
     os.getenv("DIARIZE_FAST_MERGE_THRESHOLD", "0.65")
 )
-# Fast path: per-window margin (top1-top2 cosine) below which a window counts
-# as low-margin ('auto'-mode escalation stat; measured 4-8% of windows on
-# all-known files vs 40% on an unknown-voice file). 0 disables the frame-level
-# refinement substrate entirely (coarse window labels only -- debug/AB knob).
+# Fast path: per-window low-margin cutoff (top1-top2 cosine, 'auto' escalation
+# stat); 0 disables the frame-level refinement substrate (debug/AB knob).
 DIARIZE_FAST_REFINE: float = float(os.getenv("DIARIZE_FAST_REFINE", "0.10"))
 # 'auto' mode: escalate when more than this fraction of windows is low-margin.
 DIARIZE_AUTO_MAX_LOWMARGIN: float = float(
     os.getenv("DIARIZE_AUTO_MAX_LOWMARGIN", "0.15")
 )
-# Fast path safety valve: escalate when the refined frame-level trace
-# disagrees with the coarse window labels on more than this speech fraction
-# (the fast path's own two views conflicting = untrustworthy).
+# Fast path safety valve: escalate when the refined trace disagrees with the
+# coarse window labels on more than this speech fraction.
 DIARIZE_FAST_MAX_FLIP: float = float(os.getenv("DIARIZE_FAST_MAX_FLIP", "0.20"))
 if DIARIZE_MODE not in {"fast", "auto", "pyannote"}:
     raise ValueError(f"DIARIZE_MODE must be fast|auto|pyannote, got {DIARIZE_MODE!r}")
@@ -221,18 +167,13 @@ for _name in (
         raise ValueError(f"{_name} must be in (0, 1]")
 if not 0.0 <= DIARIZE_FAST_REFINE <= 1.0:
     raise ValueError("DIARIZE_FAST_REFINE must be in [0, 1] (0 disables refinement)")
-# Run diarization on a worker thread alongside ASR+alignment when both halves
-# need computing: diarization depends only on the audio, so the branches are
-# independent. 'auto' enables it with the mlx backend (MLX and MPS share the
-# one GPU but interleave well); 'true'/'false' force it on/off.
+# Run diarization on a worker thread alongside ASR+alignment (independent
+# halves); 'auto' = on with the mlx backend, 'true'/'false' force it.
 PARALLEL_STAGES: str = (os.getenv("PARALLEL_STAGES") or "auto").lower()
 
-# Speaker memory: link diarized voices to stable SPEAKER_XX tags across files.
-# Diarization already computes per-speaker centroid embeddings internally (for
-# its own clustering); with linking on we also ask for them (no extra
-# inference) and match them against a small on-disk store, so the same voice
-# keeps the same tag in every file (new voices get the next unused tag).
-# 'false' restores per-file labels and skips the store entirely.
+# Speaker memory: the diarizer's own per-speaker centroids are matched against
+# a small on-disk store so the same voice keeps the same SPEAKER_XX tag across
+# files ('false' = per-file labels, no store).
 SPEAKER_LINKING: bool = (os.getenv("SPEAKER_LINKING") or "true").lower() in {
     "1",
     "true",
@@ -241,11 +182,8 @@ SPEAKER_LINKING: bool = (os.getenv("SPEAKER_LINKING") or "true").lower() in {
 }
 # The store (tags + centroids). Gitignored; deleting it resets the namespace.
 SPEAKER_STORE: Path = Path(os.getenv("SPEAKER_STORE", ".speakers.json"))
-# Cosine threshold above which a file speaker counts as a stored voice.
-# Calibrated on two recordings with the same speaker pair (see
-# OPTIMIZATION_LOG.md) and biased high: a missed match only costs one extra
-# tag, a false merge corrupts two identities. Same-voice cross-file cosines
-# measured 0.775-0.833; different-voice pairs 0.382-0.460.
+# Cross-file match cutoff -- calibrated and biased high: a missed match only
+# costs one extra tag, a false merge corrupts two identities.
 SPEAKER_MATCH_THRESHOLD: float = float(os.getenv("SPEAKER_LINK_THRESHOLD", "0.70"))
 
 logging.basicConfig(
@@ -255,15 +193,9 @@ logging.basicConfig(
 log = logging.getLogger("transcribe")
 
 
-# --------------------------------------------------------------------------- #
-# Memory management
-# --------------------------------------------------------------------------- #
+# --- Memory management ---
 def release_model(obj) -> None:
-    """Drop a model reference and reclaim accelerator memory.
-
-    WhisperX stages are heavy; calling this between pipeline steps is what keeps
-    us from holding two large models resident at once.
-    """
+    """Drop a model reference and reclaim accelerator memory (keeps one large model resident at a time)."""
     del obj
     gc.collect()
     try:
@@ -275,18 +207,11 @@ def release_model(obj) -> None:
         log.debug("accelerator cache clear skipped: %s", exc)
 
 
-# --------------------------------------------------------------------------- #
-# Input normalization
-# --------------------------------------------------------------------------- #
+# --- Input normalization ---
 def convert_to_mp3(
     input_path: str, out_dir: Optional[str] = None, out_name: Optional[str] = None
 ) -> str:
-    """Convert any audio container to a normalized 16 kHz mono MP3 via ffmpeg.
-
-    Runs once at the start of the pipeline so every downstream stage works from
-    the same format regardless of the input (mp3, m4a, wav, aac, ogg, flac, ...).
-    Returns the path to the converted file (created in ``out_dir``).
-    """
+    """Convert any audio container to a normalized 16 kHz mono MP3 via ffmpeg."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError(
@@ -327,28 +252,21 @@ def convert_to_mp3(
     return str(out_path)
 
 
-# --------------------------------------------------------------------------- #
-# Resume / checkpointing
-# --------------------------------------------------------------------------- #
-# The pipeline has seven stages and any of them can fail (OOM, a gated-model
-# hiccup, ...). To get resume safety we persist each stage's output to disk in
-# a per-job folder keyed by a digest of the input file's *content* + the params
-# that affect the output. Re-running the same file picks up at the last stage
-# that completed, so e.g. a diarization failure never forces a re-transcription.
+# --- Resume / checkpointing ---
+# Each stage's output is persisted to a per-job folder keyed by a digest of the
+# input file's *content* + the params that affect the output; a re-run of the
+# same file picks up at the last completed stage.
 #
 # Job folder layout (<CHECKPOINT_DIR>/<digest>/):
-#   meta.json         params, content hash, status, timings
-#   converted.mp3     [1] normalized audio
-#   asr.json          [2] raw ASR result (the expensive one)
-#   aligned.json      [4] word-aligned result
-#   diarize.json      [5] {"turns": [{"start","end","speaker"}, ...],
-#                     "embeddings": {tag: centroid},
-#                     "diarization": {strategy, mode, reasons, ...}} -- the
-#                     embeddings/diarization halves are present only when
-#                     speaker linking is on / the strategy ladder ran; the
-#                     whole file is absent when diarization was skipped
-#   final.json        [6] result after speaker assignment
-#   script.json       [7] the final clean script
+#   meta.json      params, content hash, status, timings
+#   converted.mp3  [1] normalized audio
+#   asr.json       [2] raw ASR result (the expensive one)
+#   aligned.json   [4] word-aligned result
+#   diarize.json   [5] {"turns": [...], "embeddings": {tag: centroid},
+#                  "diarization": {strategy, mode, reasons, ...}} (absent when
+#                  diarization was skipped)
+#   final.json     [6] result after speaker assignment
+#   script.json    [7] the final clean script
 _CKPT_AUDIO = "converted.mp3"
 _CKPT_ASR = "asr.json"
 _CKPT_ALIGNED = "aligned.json"
@@ -375,14 +293,12 @@ def _cache_params(
 ) -> dict:
     """Params that change a stage's output -> part of the cache key.
 
-    ``batch_size`` is intentionally excluded: it only affects speed, not the
-    transcription output, so changing it should NOT invalidate the cache.
+    ``batch_size`` is excluded (speed-only). Escalation-only knobs
+    (auto_max_lowmargin, max_flip) are excluded too: they never change a
+    *successful* fast output, only whether fast is attempted/kept.
     """
     return {
         "model": MODEL_NAME,
-        # Explicit MLX repo overrides change the ASR output (e.g. a quantized
-        # conversion) but not MODEL_NAME -- scope the cache key to the actual
-        # repo so swapped models never serve each other's cached transcripts.
         "mlx_model": MLX_MODEL,
         "asr_backend": _effective_asr_backend(),
         "asr_device": ASR_DEVICE,
@@ -390,16 +306,8 @@ def _cache_params(
         "compute_type": COMPUTE_TYPE,
         "threads": ASR_THREADS,
         "diarize_model": DIARIZE_MODEL or "default",
-        # Changes diarize output (turn boundaries) -> must scope the cache.
         "diarize_seg_step": DIARIZE_SEG_STEP,
-        # Same story for the strategy ladder: fast and pyannote produce
-        # different turn boundaries, and the fast knobs (voice cap, cluster
-        # threshold, refinement) reshape its output. One-time invalidation,
-        # like asr_backend. Escalation-only knobs (auto_max_lowmargin,
-        # max_flip) are excluded: they never change a *successful* fast
-        # output, only whether fast is attempted/kept.
         "diarize_mode": _diarize_mode(diarize_mode),
-        # A no-diarize run writes a speaker-less script -> separate cache entry.
         "diarize": diarize,
         "diarize_fast_max_voices": DIARIZE_FAST_MAX_VOICES,
         "diarize_fast_cluster_threshold": DIARIZE_FAST_CLUSTER_THRESHOLD,
@@ -413,11 +321,7 @@ def _cache_params(
 
 
 def _jsonable(obj):
-    """Coerce numpy/pandas scalars and arrays into JSON-serializable Python.
-
-    WhisperX/faster-whisper sprinkle ``numpy.float32`` etc. through their result
-    dicts; ``json.dumps`` can't serialize those directly.
-    """
+    """Coerce the numpy scalars/arrays WhisperX sprinkles through results into JSON."""
     if isinstance(obj, dict):
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -511,26 +415,14 @@ class Checkpoint:
         self._write_meta()
 
 
-# --------------------------------------------------------------------------- #
-# ASR backends
-# --------------------------------------------------------------------------- #
+# --- ASR backends ---
 def _transcribe_asr_mlx(audio: "np.ndarray", language: Optional[str]) -> dict:
     """Transcribe with MLX whisper on the Apple GPU (Metal, fp16), VAD-chunked.
 
-    Same model weights as the ct2 path (mlx-community conversions of the
-    OpenAI checkpoints) but the encoder/decoder matmuls run on the GPU, which
-    is several times faster than CTranslate2 int8 on this class of CPU.
-
     The audio is first split into speech chunks with whisperx's own Pyannote
-    VAD -- the exact chunker the ct2 backend uses -- and each chunk is
-    transcribed independently. This is not optional: whisper's fixed 30s
-    windowing over unchunked audio skips over speech (seek jumps) and
-    repetition-loops on long context (a known turbo artifact), which the VAD
-    chunking avoids. A bonus: each chunk starts with fresh context, so the
-    greedy decode cannot inherit a loop from previous windows.
-
-    Word timestamps come from the alignment stage as before, so only
-    start/end/text are kept per segment.
+    VAD (the exact chunker the ct2 backend uses). This is not optional: over
+    unchunked audio, whisper's fixed 30s windowing skips speech (seek jumps)
+    and repetition-loops on long context (a known turbo artifact).
     """
     import mlx_whisper
     from whisperx.audio import SAMPLE_RATE
@@ -595,9 +487,7 @@ def _transcribe_asr_mlx(audio: "np.ndarray", language: Optional[str]) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# Diarization (shared by the sequential and parallel paths)
-# --------------------------------------------------------------------------- #
+# --- Diarization (shared by the sequential and parallel paths) ---
 def _parallel_diarize_enabled() -> bool:
     """Resolve PARALLEL_STAGES ('auto' -> on with the mlx backend)."""
     if PARALLEL_STAGES in {"1", "true", "yes", "on"}:
@@ -608,11 +498,7 @@ def _parallel_diarize_enabled() -> bool:
 
 
 def _diarize_mode(override: Optional[str] = None) -> str:
-    """Resolve the diarization strategy: 'pyannote' | 'fast' | 'auto'.
-
-    ``override`` comes from the CLI/API (``--diarize-mode`` / ``diarize_mode``)
-    and beats DIARIZE_MODE from the environment, which defaults to 'fast'.
-    """
+    """Resolve the strategy: CLI/API override beats DIARIZE_MODE (default 'fast')."""
     mode = (override or DIARIZE_MODE).lower()
     if mode not in {"pyannote", "fast", "auto"}:
         raise ValueError(f"diarize mode must be fast|auto|pyannote, got {mode!r}")
@@ -643,22 +529,13 @@ def _run_diarization(
 ) -> tuple["pd.DataFrame", dict, float, dict]:
     """Run the diarization strategy ladder, then free the pipeline.
 
-    'pyannote' goes straight to the full pipeline. 'fast' (default) and
-    'auto' first try the fast path (VAD-window embeddings verified against
-    the speaker roster -- see the fast-path section above) and escalate to
-    the full pipeline on the same loaded object when the fast path refuses
-    its own result; 'auto' additionally escalates on weak quality signals
-    (a large fraction of low-margin windows). Both rungs' triggers land in
-    ``info["reasons"]``.
+    'fast'/'auto' try the fast path first and escalate to the full pipeline on
+    the same loaded object when it refuses its own result; 'auto' additionally
+    escalates on weak quality signals. Triggers land in ``info["reasons"]``.
 
-    Returns ``(segments frame, centroids, elapsed seconds, info)``. The full
-    pipeline returns its per-speaker centroids alongside the turns (computed
-    for its clustering anyway); the fast path returns its verified per-tag
-    centroids. ``info`` records the ladder decision (strategy, mode,
-    reasons, stats) and is checkpointed next to the turns. Runs on the main
-    thread or on the diarize worker; it must not touch the Checkpoint
-    (meta.json races with the main thread) -- the caller persists the result
-    after joining.
+    Returns ``(segments frame, centroids, elapsed seconds, info)``. May run on
+    the diarize worker thread: must not touch the Checkpoint (meta.json races
+    with the main thread) -- the caller persists the result after joining.
     """
     t0 = time.perf_counter()
     if not HF_TOKEN:
@@ -672,13 +549,8 @@ def _run_diarization(
         diarize_kwargs["model_name"] = DIARIZE_MODEL
     diarize_pipeline = DiarizationPipeline(**diarize_kwargs)
     if DIARIZE_SEG_STEP > 0 and DIARIZE_SEG_STEP != 1.0:
-        # The embedding stage (94% of diarize wall-clock) runs one 10s crop per
-        # local speaker per segmentation window; the default 1.0s hop (90%
-        # window overlap) makes it process ~20x the audio duration. A 2.0s hop
-        # halves that for a 2x stage speedup with 98.4% frame-level agreement
-        # on our eval audio (see OPTIMIZATION_LOG.md). The Inference bakes its
-        # step at pipeline init, so patch the built object directly. The fast
-        # path's refinement substrate inherits the same patched hop.
+        # The Inference bakes its step at init, so patch the built object
+        # directly (setting a `segmentation_step` attr does nothing).
         diarize_pipeline.model._segmentation.step = DIARIZE_SEG_STEP
 
     def _full(reasons: list[str]) -> tuple["pd.DataFrame", dict, dict]:
@@ -701,8 +573,7 @@ def _run_diarization(
         if mode == "pyannote":
             segments, centroids, info = _full(["mode=pyannote"])
         elif not SPEAKER_LINKING:
-            # The fast path is roster verification; with speaker memory off
-            # there is nothing to verify against -- always full pipeline.
+            # Fast path is roster verification; nothing to verify against.
             segments, centroids, info = _full(["speaker linking off"])
         else:
             try:
@@ -748,15 +619,10 @@ def _run_diarization(
         release_model(diarize_pipeline)
 
 
-# --------------------------------------------------------------------------- #
-# Speaker memory (stable tags across files)
-# --------------------------------------------------------------------------- #
-# Diarization labels each file in isolation (SPEAKER_00, SPEAKER_01, ...), so
-# the same person gets a different tag in every recording. With SPEAKER_LINKING
-# on, one centroid per voice is kept in a small on-disk store and every new
-# file is relabeled against it: a known voice keeps its tag across all files,
-# a new voice takes the next unused tag (in first-appearance order). Tags are
-# deliberately anonymous -- stable identity, never names.
+# --- Speaker memory (stable tags across files) ---
+# One centroid per voice is kept in a small on-disk store and every new file is
+# relabeled against it: a known voice keeps its tag across files, a new voice
+# takes the next unused tag. Tags are deliberately anonymous, never names.
 _SPEAKER_STORE_VERSION = 1
 
 
@@ -765,12 +631,8 @@ def _now_iso() -> str:
 
 
 def _unit_centroid(centroid: list[float]) -> Optional["np.ndarray"]:
-    """L2-normalized centroid as float64, or None if it is degenerate.
-
-    pyannote zero-pads centroids when its clustering finds fewer clusters than
-    labels; a zero vector carries no identity and must not be matched or
-    stored.
-    """
+    """L2-normalized centroid, or None if degenerate (pyannote zero-pads when
+    clusters < labels; a zero vector carries no identity)."""
     vec = np.asarray(centroid, dtype=np.float64)
     norm = float(np.linalg.norm(vec))
     if norm < 1e-9:
@@ -779,11 +641,8 @@ def _unit_centroid(centroid: list[float]) -> Optional["np.ndarray"]:
 
 
 def _read_store() -> dict:
-    """Load the speaker store; a missing or corrupt store starts fresh.
-
-    A corrupt store is parked as ``.speakers.json.corrupt-<epoch>`` rather than
-    silently renumbering the tag namespace.
-    """
+    """Load the speaker store; missing or corrupt starts fresh (a corrupt store
+    is parked as .speakers.json.corrupt-<epoch>, not silently renumbered)."""
     empty = {
         "version": _SPEAKER_STORE_VERSION,
         "next_tag": 0,
@@ -817,13 +676,8 @@ def _write_store(store: dict) -> None:
 
 
 def _update_entry(entry: dict, unit: "np.ndarray", source_name: str) -> None:
-    """Fold one unit centroid into an existing store entry (running mean).
-
-    The mean is weighted by how many enrollments each side already carries,
-    then re-normalized so the stored centroid stays unit-length. Shared by the
-    linking path (new evidence for a matched or freshly allocated tag) and the
-    fast-path refresh (evidence for a tag verified against the roster).
-    """
+    """Fold one unit centroid into an existing store entry (enrollment-weighted
+    running mean, re-normalized to unit length)."""
     n = int(entry.get("n_embeddings", 1))
     prev = _unit_centroid(entry["centroid"])
     mean = unit + n * prev if prev is not None else unit * (n + 1)
@@ -842,17 +696,13 @@ def _link_speakers(
 ) -> tuple[list[dict], dict[str, list[float]]]:
     """Relabel per-file speaker tags to stable cross-file tags.
 
-    Matches each file speaker's centroid against the stored voices by cosine
-    similarity (best match per file speaker above ``SPEAKER_MATCH_THRESHOLD``;
-    two local labels may legitimately map to the same stored voice when
-    clustering over-split one person). New voices allocate the next unused tag.
-    The store is read and written under an exclusive lock on a sidecar lock
-    file, so concurrent jobs (CLI + server, or two API uploads) serialize
-    cleanly; the data file itself is always replaced atomically.
-
-    Returns ``(relabeled rows, centroids keyed by the global tag)`` and logs
-    every candidate similarity -- which doubles as the calibration instrument
-    (see OPTIMIZATION_LOG.md).
+    Best stored match per file speaker above ``SPEAKER_MATCH_THRESHOLD``
+    (non-exclusive: two local labels may map to the same stored voice when
+    clustering over-split one person); new voices allocate the next unused
+    tag. Store access is serialized by an exclusive flock on a sidecar lock
+    file, and the data file is always replaced atomically. All candidate
+    similarities are logged -- the calibration instrument (see
+    OPTIMIZATION_LOG.md).
     """
     if not rows:
         return rows, {}
@@ -961,11 +811,10 @@ def _refresh_enrolled(
     """Fold a fast-path run's centroids into already-enrolled store entries.
 
     The fast path only keeps its result when every voice verified against the
-    roster, so its rows already carry global tags -- nothing to relabel and
-    nothing to allocate. This just refreshes those tags' running means (the
-    run is fresh evidence about each voice) under the same exclusive lock
-    ``_link_speakers`` uses. A tag that vanished from the store mid-run is
-    skipped with a warning rather than resurrected: never allocate here.
+    roster, so its rows already carry global tags -- nothing to relabel or
+    allocate, just refresh the running means under the same exclusive lock
+    ``_link_speakers`` uses. Never allocate here; a tag that vanished from
+    the store mid-run is skipped with a warning.
     """
     if not embeddings:
         return {}
@@ -999,42 +848,32 @@ def _refresh_enrolled(
     return refreshed
 
 
-# --------------------------------------------------------------------------- #
-# Fast diarization (the 'fast'/'auto' rungs of the diarization ladder)
-# --------------------------------------------------------------------------- #
-# The full pyannote pipeline slides a 10s segmentation window over the file
-# and embeds one crop per local speaker per window -- that embedding stage is
-# 94% of the diarize wall-clock. The K probe (OPTIMIZATION_LOG.md) measured
-# that embedding ONE window per VAD region instead (with the diarizer's own
-# embedding model, the same object the full pipeline uses) costs ~13s/hour vs
-# ~127s for the full stage, and that a file's voice centroids separate known
-# from unknown roster voices by a wide cosine canyon (0.76+ vs <=0.45).
-# The fast path exploits exactly that: tile the ASR path's VAD speech regions
-# into <=10s windows, embed them, cluster in numpy, and verify each cluster's
-# centroid against the speaker roster. It only keeps the result when every
-# voice is known and its own frame-level refinement agrees; otherwise the
-# ladder escalates to the full pipeline on the same loaded object, which is
-# exactly today's behavior. All quality gates come from probe measurements.
+# --- Fast diarization (the 'fast'/'auto' rungs of the diarization ladder) ---
+# The full pyannote pipeline embeds one crop per local speaker per segmentation
+# window -- 94% of the diarize wall-clock. The fast path instead tiles the VAD
+# speech regions into <=10s windows, embeds them once (with the diarizer's own
+# embedding model), clusters in numpy, and verifies each cluster's centroid
+# against the speaker roster. It keeps the result only when every voice is
+# known and its own refinement agrees; otherwise the ladder escalates to the
+# full pipeline on the same loaded object. All gates come from probe
+# measurements (see OPTIMIZATION_LOG.md).
 _FAST_WIN = 10.0  # embedding window (s) -- matches pyannote's crop length
-_FAST_MIN_SEG = 1.0  # VAD regions shorter than this are skipped (the
-# embedding model NaNs out on too few masked frames)
+_FAST_MIN_SEG = 1.0  # VAD regions shorter than this are skipped (embedding
+# model NaNs out on too few masked frames)
 _FAST_MERGE_TAIL = 2.0  # trailing window piece shorter than this folds back
 _FAST_BATCH = 32  # embedding/segmentation batch size (pyannote's own)
 _FAST_CHANNEL_MIN = 0.4  # refinement: channel keeps a tag above this activity
 _FAST_EMBED_MASS = 1.0  # unmapped channel activation (s) worth an identity
-# probe -- its masked crop is embedded and matched to the clusters (see
-# _refine_turns: window-level supervision is blind to sub-window turns)
+# probe (window-level supervision is blind to sub-window turns)
 _FAST_MIN_RUN = 0.15  # refinement: activation flicker shorter than this folds
-# into a neighbor (pyannote's own min_duration_on default is 0 -- its turns
-# can be sub-second, so keep this to flicker removal only)
+# into a neighbor (pyannote's min_duration_on defaults to 0)
 
 
 def _read_roster_snapshot() -> dict[str, "np.ndarray"]:
-    """``{tag: unit centroid}`` snapshot of the speaker store (read-only).
+    """``{tag: unit centroid}`` snapshot of the speaker store.
 
-    Runs on the diarize worker under a SHARED lock on the sidecar lock file.
-    The worker never writes the store; a shared lock is enough to keep the
-    snapshot consistent against a concurrent main-thread enrollment.
+    Runs on the diarize worker under a SHARED flock (the worker never writes
+    the store; shared is enough against a concurrent main-thread enrollment).
     """
     lock_path = SPEAKER_STORE.with_name(f"{SPEAKER_STORE.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1054,14 +893,10 @@ def _read_roster_snapshot() -> dict[str, "np.ndarray"]:
 
 
 def _fast_vad(audio: "np.ndarray") -> tuple[list[dict], float]:
-    """Speech regions via whisperx's Pyannote VAD -- the ASR path's chunker.
+    """Raw speech regions via the same Pyannote VAD the ASR path chunked with.
 
-    Same VAD model and parameters as ``_transcribe_asr_mlx`` (onset 0.5 /
-    offset 0.363) but keeping the *raw* binarized regions instead of merging
-    them into 30s ASR chunks: diarization wants voice-homogeneous spans, not
-    transcription-sized bites. This is a second VAD pass over audio the ASR
-    path has already VAD-chunked (the ASR chunking is deliberately not
-    persisted); on the worker it hides under ASR in parallel mode.
+    Keeps the raw binarized regions instead of merging into 30s ASR chunks:
+    diarization wants voice-homogeneous spans, not transcription-sized bites.
     """
     from whisperx.audio import SAMPLE_RATE
     from whisperx.vads import Pyannote
@@ -1092,11 +927,9 @@ def _tile_windows(
 ) -> tuple[list[tuple[float, float, float, int]], float]:
     """Tile VAD regions into <=``_FAST_WIN`` windows.
 
-    Returns ``(windows, skipped_seconds)`` where each window is
-    ``(win_start, piece_start, piece_end, seg_idx)``: the piece is the part
-    of the window that actually contains speech (the embedding mask zeroes
-    the rest) and a trailing piece shorter than ``_FAST_MERGE_TAIL`` folds
-    into a window ending at the region end.
+    Each window is ``(win_start, piece_start, piece_end, seg_idx)``: the piece
+    is the speech-bearing part (the embedding mask zeroes the rest). Returns
+    ``(windows, skipped_seconds)``.
     """
     windows: list[tuple[float, float, float, int]] = []
     skipped = 0.0
@@ -1122,12 +955,10 @@ def _embed_windows(
 ) -> tuple["np.ndarray", "np.ndarray", float]:
     """Embed every window with the diarizer's own embedding model.
 
-    Waveforms are ``_FAST_WIN`` crops starting at ``win_start`` (zero-padded
-    at the file tail) with a sample-resolution mask marking the speech piece
-    -- the exact input contract ``pipeline.model._embedding`` uses internally.
-    Returns ``(unit-normalized embeddings, usable mask, seconds)``; windows
-    whose embedding is NaN or zero-norm (too little masked speech) come back
-    unusable and are dropped by the caller.
+    ``_FAST_WIN`` crops + sample-resolution speech masks (the exact input
+    contract ``pipeline.model._embedding`` uses internally). Returns
+    ``(unit-normalized embeddings, usable mask, seconds)``; NaN/zero-norm
+    windows (too little masked speech) come back unusable.
     """
     t0 = time.perf_counter()
     if not windows:
@@ -1165,23 +996,9 @@ def _cluster_windows(
 ) -> tuple[list[int], int]:
     """Cluster window embeddings into voices (numpy-only, deterministic).
 
-    Four passes, each justified by eval-file measurements (OPTIMIZATION_LOG):
-
-    1. Greedy leaders, duration-desc: the longest unassigned window founds a
-       cluster and claims every still-unassigned window within
-       ``join_threshold`` -- first-claim, cheap seeds on the cleanest speech.
-    2. Lloyd cleanup: recompute duration-weighted unit centroids and move
-       each window to its best-cosine cluster (>= ``join_threshold``) until
-       no window moves. First-claim seeding strands windows on the wrong
-       side of two voices in the same file (a 74/26 mixed cluster on the
-       minsuk-1-1 eval); best-centroid reassignment pulls them back.
-    3. Consolidation: noise clusters (<3 windows AND <1% of speech) fold
-       into their nearest survivor; near-duplicate centroids (>=
-       ``merge_threshold``) merge -- one voice splits into fragments when
-       its acoustic mode drifts mid-file (mic/channel change; fragments
-       measured >=0.71 centroid cosine while distinct voices stayed <=0.51).
-    4. One more Lloyd pass over the consolidated clusters.
-
+    Greedy duration-desc leaders -> Lloyd cleanup -> consolidation (noise
+    clusters fold; near-duplicate centroids merge) -> one more Lloyd pass.
+    Each pass exists because of a measured failure mode (OPTIMIZATION_LOG).
     Returns ``(labels 0..k-1, number of raw seeds before consolidation)``.
     """
     n = len(E)
@@ -1273,12 +1090,8 @@ def _cluster_windows(
 def _verify_roster(
     centroids: list["np.ndarray"], roster: dict[str, "np.ndarray"]
 ) -> list[tuple[str, float]]:
-    """Best roster match per cluster centroid (non-exclusive).
-
-    Mirrors ``_link_speakers``: every cluster independently takes its best
-    stored voice -- two clusters may legitimately share a tag when clustering
-    over-split one person. Returns one ``(tag, cosine)`` per cluster.
-    """
+    """Best roster match per cluster centroid (non-exclusive, like _link_speakers:
+    two clusters may share a tag when clustering over-split one person)."""
     tags = sorted(roster)
     C = np.stack([roster[t] for t in tags])
     matches: list[tuple[str, float]] = []
@@ -1294,13 +1107,9 @@ def _coarse_turns(
 ) -> list[dict]:
     """Turns from per-window tags: merge same-tag windows within a VAD region.
 
-    Deliberately no neighborhood smoothing: with 10s windows a turn change
-    lands inside two of any three voting windows, and ablating on the eval
-    files showed median smoothing flipping whole windows near boundaries
-    (93.4% -> 88.9% word agreement) while the frame-level refinement --
-    which has real boundary evidence -- recovers them (96.5% from raw
-    labels). Runs merge only within a region, so turns always break at
-    silence.
+    No neighborhood smoothing (ablation: it flips whole windows near
+    boundaries; the frame-level refinement recovers them properly). Runs merge
+    only within a region, so turns always break at silence.
     """
     rows: list[dict] = []
     last_si = -1
@@ -1324,38 +1133,18 @@ def _refine_turns(
     """Refine coarse window labels with the diarizer's segmentation substrate.
 
     The coarse path labels whole 10s windows, so a turn change inside a window
-    lands on the wrong side of the boundary -- the K probe found nearly all
-    fast-path error within 2-3s of a real turn boundary and *not* recoverable
-    from label transitions alone. The segmentation head is cheap (~6% of the
-    full stage) and yields frame-level (~16ms) per-channel activations for the
-    whole file in one batched pass. Its output channels are anonymous and
-    permuted per chunk, so each chunk's channels are mapped to tags under
-    supervision of the coarse labels (a channel keeps its top tag iff it is
-    that tag's best channel and carries >= ``_FAST_CHANNEL_MIN`` of its own
-    activation). Overlapping chunks then contribute their mapped channels'
-    activation mass per frame (soft voting -- ablation showed hard per-chunk
-    argmax saturates ~4 points lower, because it discards how *close* the
-    second voice is at every frame); frames with no mass inherit the coarse
-    label. Turns are re-cut from that frame consensus, breaking at VAD gaps
-    and folding sub-``_FAST_MIN_RUN`` runs into their longer neighbor.
+    lands on the wrong side of the boundary. The segmentation head is cheap
+    (~6% of the full stage) and yields frame-level (~16ms) per-channel
+    activations for the whole file in one batched pass. Its channels are
+    anonymous and permuted per chunk, so each chunk's channels are mapped to
+    tags under supervision of the current consensus, and *unexplained* channels
+    get an identity probe (see ``_probe_unexplained``); overlapping chunks then
+    contribute soft activation-mass votes per frame, and turns are re-cut from
+    the frame consensus.
 
-    Supervision alone cannot see turns shorter than a window: a 10s window
-    dominated 8:2 by voice A labels B's channel as A, B never earns vote
-    mass, and whole interjections get swallowed (minsuk-1-1: 38 refined turns
-    vs pyannote's 190, a 4.2s SPEAKER_01 turn fully inside a SPEAKER_00 run).
-    So once, after the first supervised mapping, every *unexplained* channel
-    (>= ``_FAST_EMBED_MASS`` of activation that supervision did not keep) gets
-    an identity probe: its masked crop is embedded -- pyannote's own channel
-    identification mechanism -- and matched against ``centroids`` (the
-    roster-verified cluster centroids). A match at the join threshold
-    overrides supervision: identity evidence outranks blocky timing evidence.
-    Only mixed chunks carry unexplained mass, so the probe costs a fraction
-    of the window-embedding stage.
-
-    Returns ``(rows, stats)``. ``stats["flip_frac"]`` is the speech fraction
-    where the refined trace disagrees with the coarse labels -- the fast
-    path's two independent views of the same audio, and the ladder's T9
-    escalation trigger when they disagree too much.
+    Returns ``(rows, stats)``; ``stats["flip_frac"]`` is the speech fraction
+    where the refined trace disagrees with the coarse labels (the T9
+    escalation trigger).
     """
     t0 = time.perf_counter()
     from whisperx.audio import SAMPLE_RATE
@@ -1391,13 +1180,9 @@ def _refine_turns(
         speech[int(np.floor(s["start"] / res)) : int(np.ceil(s["end"] / res))] = True
 
     def _forward_fill(final: np.ndarray) -> np.ndarray:
-        # Label trace over *every* frame: silent/unvoted frames carry the
-        # previous label forward (backfilling the head/tail) so short pauses do
-        # not shred turns -- pyannote labels silent frames too, and its default
-        # min_duration_on/off are 0, so its turns bridge micro-gaps and can be
-        # sub-second long. Breaking runs at any non-speech frame instead cost
-        # several points of word agreement on the eval files (it swallowed the
-        # short GT turns whole).
+        # Carry the previous label through silent/unvoted frames: pyannote's
+        # turns bridge micro-gaps (min_duration_on/off are 0), and breaking
+        # runs at every non-speech frame swallows short turns.
         trace = final.copy()
         valid = np.nonzero(trace >= 0)[0]
         if len(valid):
@@ -1413,16 +1198,12 @@ def _refine_turns(
     ) -> dict[int, list[tuple[int, int, float]]]:
         """Identify channels by masked-crop embedding, not by time labels.
 
-        Supervision goes backwards exactly where it matters: a chunk of pure
-        voice B whose covering window straddled a boundary A-majority gets
-        B's channel mapped to A (minsuk-1-1 chunk [686,696]: 9.9s of pure
-        SPEAKER_01 at masked-crop cos 0.86, supervised as SPEAKER_00), and it
-        then votes for the wrong voice with full mass. So every channel
-        carrying >= ``_FAST_EMBED_MASS`` of activation in a chunk with two or
-        more such channels -- the mixed chunks, and every boundary-adjacent
-        chunk -- is identified by embedding its own masked crop; a lone
-        massy channel is only probed when supervision left it unmapped (pure
-        stretches deep inside a turn are already right).
+        Supervision goes backwards on sub-window turns: a pure-voice-B chunk
+        whose covering window straddled an A-majority boundary gets B's
+        channel mapped to A, which then votes for the wrong voice with full
+        mass. So every channel carrying >= ``_FAST_EMBED_MASS`` of activation
+        in a mixed chunk is identified by embedding its own masked crop; a
+        lone massy channel only when supervision left it unmapped.
         """
         jobs: list[tuple[int, int]] = []
         for c in range(n_chunks):
@@ -1482,16 +1263,12 @@ def _refine_turns(
         )
         return fixes
 
-    # Iterated refinement. Round 0 supervises the per-chunk channel->tag maps
-    # with the *coarse* labels, whose boundaries are blocky at window
-    # granularity: a chunk straddling a real turn change often holds no
-    # supervised frames for the second voice, so that voice's channel stays
-    # unmapped and gets no vote mass near the boundary -- exactly the 1-2s
-    # displacement band in the error anatomy. The identity probe patches the
-    # gaps supervision cannot fill, and the round-0 consensus then places
-    # boundaries at the activation-mass crossover, so re-supervising the maps
-    # with it and re-voting sharpens them further; the loop converges in 2-3
-    # rounds and everything past the substrate pass is cheap numpy.
+    # Iterated refinement: supervise the channel->tag maps with the current
+    # consensus, probe what supervision cannot explain, re-vote. Round 0's
+    # blocky window-granularity boundaries leave the second voice unmapped
+    # near real turn changes; the probe patches those gaps, the consensus
+    # then places boundaries at the activation-mass crossover, and re-superv
+    # sharpens further. Converges in 2-3 rounds.
     trace = _forward_fill(coarse_trace)
     embed_fixes: dict[int, list[tuple[int, int, float]]] = {}
     for _round in range(3):
@@ -1525,8 +1302,7 @@ def _refine_turns(
                     del m[k2]
                 m[k] = tid
         # Frame-level consensus: each covering chunk contributes its mapped
-        # channels' activation mass, so a boundary lands at the mass crossover
-        # between the two voices rather than at some chunk's hard argmax edge.
+        # channels' activation mass -- boundaries land at the mass crossover.
         votes = np.zeros((n_global, len(tags_list)))
         for c in range(n_chunks):
             if not kept[c]:
@@ -1548,9 +1324,8 @@ def _refine_turns(
         float((trace[judged] != coarse_trace[judged]).mean()) if judged.any() else 0.0
     )
 
-    # Runs = maximal same-label stretches; trim each to the VAD speech inside
-    # it and drop runs with none. Only activation flicker (sub-min-run) folds
-    # into its longer neighbor.
+    # Runs = maximal same-label stretches, trimmed to VAD speech; only
+    # sub-min-run flicker folds into a longer neighbor.
     runs: list[list[int]] = []  # [start_frame, end_frame, tag_id]
     start = 0
     for i in range(1, n_global + 1):
@@ -1589,8 +1364,7 @@ def _refine_turns(
                 trimmed.pop(i)
                 changed = True
                 break
-    # Single-frame VAD seams can split a turn into two same-tag rows that meet
-    # exactly -- stitch those back.
+    # Single-frame VAD seams can split a turn into two abutting same-tag rows.
     rows: list[dict] = []
     for r in trimmed:
         if (
@@ -1629,11 +1403,9 @@ def _fast_diarize(
 ) -> tuple[Optional[list[dict]], dict[str, list[float]], dict]:
     """One fast-path attempt. Returns ``(rows, centroids_by_tag, info)``.
 
-    ``rows is None`` means the attempt refused its own result -- ``info[
-    "reasons"]`` names the ladder trigger(s) that fired and the caller
-    escalates to the full pipeline. Empty ``rows`` (VAD found no speech) is a
-    *success*: there is nothing for pyannote to diarize either. On success the
-    rows already carry global roster tags (that is what was verified).
+    ``rows is None`` = the attempt refused itself (``info["reasons"]`` names
+    the trigger(s); the caller escalates). Empty ``rows`` (no VAD speech) is
+    a *success*. On success the rows already carry global roster tags.
     """
     info: dict = {"strategy": "fast", "mode": mode, "reasons": []}
 
@@ -1778,9 +1550,7 @@ def _fast_diarize(
     return rows, centroids_out, info
 
 
-# --------------------------------------------------------------------------- #
-# Pipeline engine core (sequential, blocking)
-# --------------------------------------------------------------------------- #
+# --- Pipeline engine core (sequential, blocking) ---
 def run_pipeline(
     audio_path: str,
     *,
@@ -1794,27 +1564,16 @@ def run_pipeline(
 ) -> list[dict]:
     """Transcribe ``audio_path`` end-to-end and return a clean speaker script.
 
-    Stages run one model at a time on the critical path (each freed before the
-    next loads), with one structural exception: diarization depends only on the
-    audio, so when ASR/alignment also need computing it runs concurrently on a
-    worker thread and is joined before speaker assignment (PARALLEL_STAGES):
+    One model at a time on the critical path (each freed before the next
+    loads), except diarization: it depends only on the audio, so it runs on a
+    worker thread in parallel with ASR+alignment and is joined before speaker
+    assignment. Stages: convert -> ASR -> free -> align -> diarize -> assign ->
+    ``[{"time", "speaker", "text"}, ...]``.
 
-      1. convert the input to a normalized mp3 (ffmpeg)
-      2. load ASR model (``MODEL_NAME``) -> load audio -> transcribe (small batch)
-      3. free the ASR model
-      4. load alignment model -> align word timestamps -> free it
-      5. load diarization pipeline (uses ``HF_TOKEN``) -> diarize -> free it
-      6. assign speakers to segments
-      7. shape into ``[{"time": {"start", "end"}, "speaker", "text"}, ...]``
-
-    ``diarize=False`` (``--no-diarize`` / ``?diarize=false``) skips stages 5-6
-    entirely -- transcription and word alignment only, no ``HF_TOKEN`` needed,
-    and the script's ``speaker`` fields are ``None``.
-
-    When ``resume`` is true (default; toggle with ``RESUME``) every stage's
-    output is checkpointed under ``CHECKPOINT_DIR`` keyed by the input's content
-    hash + params, so a re-run on the same file resumes from the last completed
-    stage instead of starting over. Per-stage and total timings are logged.
+    ``diarize=False`` (``--no-diarize``) skips diarization+assignment entirely
+    -- no ``HF_TOKEN`` needed, ``speaker`` fields are ``None``. With ``resume``
+    (default) every stage is checkpointed, so a re-run picks up at the last
+    completed stage.
     """
     timings: dict[str, float] = {}
     total_t0 = time.perf_counter()
@@ -1873,9 +1632,8 @@ def run_pipeline(
         if need_asr or need_aligned or need_diarize:
             audio = whisperx.load_audio(audio_path)
 
-        # Diarization depends only on the audio, not on the ASR result -- when
-        # the other heavy half also needs computing, run it on a worker thread
-        # in parallel and join before speaker assignment.
+        # Diarization is independent of ASR -- when both halves need computing,
+        # run it on a worker thread and join before speaker assignment.
         diarize_future = None
         if need_diarize and (need_asr or need_aligned) and _parallel_diarize_enabled():
             log.info("[5/7] diarization running in parallel with ASR/alignment")
@@ -1892,8 +1650,7 @@ def run_pipeline(
             with _timed(timings, "asr"):
                 if _effective_asr_backend() == "mlx":
                     result = _transcribe_asr_mlx(audio, language)
-                    # MLX caches the model in-process (ModelHolder); nothing to
-                    # free between runs, and the next stage owns the GPU anyway.
+                    # MLX caches the model in-process (ModelHolder); nothing to free.
                     log.info("[3/7] MLX model stays cached in-process")
                 else:
                     log.info(
@@ -2003,9 +1760,8 @@ def run_pipeline(
             embeddings_out: dict[str, list[float]] = {}
             if SPEAKER_LINKING and rows:
                 if diarize_info.get("strategy") == "fast" and centroids:
-                    # Fast-path rows already carry stable roster tags (that is
-                    # what was verified) -- nothing to relabel or allocate;
-                    # fold this run's centroids into the existing entries.
+                    # Rows already carry stable roster tags -- nothing to
+                    # relabel or allocate, just refresh the running means.
                     link_t0 = time.perf_counter()
                     embeddings_out = _refresh_enrolled(centroids, input_name)
                     log.info(
@@ -2070,9 +1826,8 @@ def run_pipeline(
 def build_script(result: dict, with_speakers: bool = True) -> list[dict]:
     """Turn a WhisperX result into ``[{"time", "speaker", "text"}, ...]``.
 
-    ``with_speakers=False`` (``--no-diarize``) leaves ``speaker`` as ``None``
-    for every segment; renderers then omit the speaker labels.
-    """
+    ``with_speakers=False`` (``--no-diarize``) leaves ``speaker`` ``None``;
+    renderers then omit the labels."""
     segments = result["segments"] if isinstance(result, dict) else result.segments
     script: list[dict] = []
     for seg in segments:
@@ -2089,9 +1844,7 @@ def build_script(result: dict, with_speakers: bool = True) -> list[dict]:
     return script
 
 
-# --------------------------------------------------------------------------- #
-# Async worker
-# --------------------------------------------------------------------------- #
+# --- Async worker ---
 async def transcribe_async(
     audio_path: str,
     *,
@@ -2115,9 +1868,7 @@ async def transcribe_async(
     )
 
 
-# --------------------------------------------------------------------------- #
-# FastAPI service
-# --------------------------------------------------------------------------- #
+# --- FastAPI service ---
 app = FastAPI(title="Transcription Service", version="0.1.0")
 
 # task_id -> {"status", "created_at", "result", "error"}  (in-memory)
@@ -2223,9 +1974,7 @@ async def get_task(task_id: str) -> dict:
     return {"task_id": task_id, **task}
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
+# --- CLI ---
 def cli_transcribe(args: argparse.Namespace) -> int:
     # Resolve input: a bare filename is looked up under DATA_DIR (./Data) first.
     in_path = Path(args.file)
@@ -2300,11 +2049,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--diarize-mode",
         choices=["fast", "auto", "pyannote"],
         default=None,
-        help="Diarization strategy: 'fast' (VAD-window embeddings verified "
-        "against the speaker roster, escalates to full pyannote when it "
-        "cannot be trusted), 'auto' (fast, additionally escalating on weak "
-        "quality signals), or 'pyannote' (always the full pipeline). "
-        "Defaults to DIARIZE_MODE from the environment ('fast').",
+        help="Diarization strategy: 'fast' (default; falls back to the full "
+        "model when it can't be trusted), 'auto' (falls back more eagerly), "
+        "or 'pyannote' (always the full pipeline).",
     )
     p_transcribe.add_argument(
         "--no-diarize",
