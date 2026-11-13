@@ -1571,7 +1571,7 @@ def run_pipeline(
     ``[{"time", "speaker", "text"}, ...]``.
 
     ``diarize=False`` (``--no-diarize``) skips diarization+assignment entirely
-    -- no ``HF_TOKEN`` needed, ``speaker`` fields are ``None``. With ``resume``
+    -- no ``HF_TOKEN`` needed, every segment labeled SPEAKER_00. With ``resume``
     (default) every stage is checkpointed, so a re-run picks up at the last
     completed stage.
     """
@@ -1826,18 +1826,19 @@ def run_pipeline(
 def build_script(result: dict, with_speakers: bool = True) -> list[dict]:
     """Turn a WhisperX result into ``[{"time", "speaker", "text"}, ...]``.
 
-    ``with_speakers=False`` (``--no-diarize``) leaves ``speaker`` ``None``;
-    renderers then omit the labels."""
+    ``with_speakers=False`` (``--no-diarize``) labels every segment SPEAKER_00,
+    so the output shape matches diarized runs."""
     segments = result["segments"] if isinstance(result, dict) else result.segments
     script: list[dict] = []
     for seg in segments:
         start = float(seg.get("start", 0.0) or 0.0)
         end = float(seg.get("end", start) or start)
         text = (seg.get("text") or "").strip()
+        speaker = (seg.get("speaker") or "UNKNOWN") if with_speakers else "SPEAKER_00"
         script.append(
             {
                 "time": {"start": round(start, 3), "end": round(end, 3)},
-                "speaker": (seg.get("speaker") or "UNKNOWN") if with_speakers else None,
+                "speaker": speaker,
                 "text": text,
             }
         )
@@ -2057,8 +2058,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-diarize",
         action="store_true",
         help="Skip speaker diarization entirely: transcription + word "
-        "timestamps only, no speaker labels (and no HF_TOKEN needed). "
-        "Ignores --diarize-mode/--min-speakers/--max-speakers.",
+        "timestamps only, every segment labeled SPEAKER_00 (no HF_TOKEN "
+        "needed). Ignores --diarize-mode/--min-speakers/--max-speakers.",
     )
     p_transcribe.add_argument(
         "--batch-size",

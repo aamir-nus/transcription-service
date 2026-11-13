@@ -39,6 +39,17 @@ Anything ffmpeg can decode: `mp3`, `m4a`/`aac`, `wav`, `ogg`/`opus`, `flac`,
 extracted). Inputs are normalized to 16 kHz mono automatically, so no
 pre-processing is needed.
 
+## Quality
+
+Measured on internal two-speaker meeting audio (English; expect different
+numbers on other material):
+
+- **Transcription** — Whisper `large-v3-turbo`, ~8.8% word error rate.
+- **Diarization** — the default `fast` mode attributes 98.1–98.4% of words to
+  the same speaker as the full pyannote pipeline; the residual is almost
+  entirely genuinely overlapped speech (both voices active at once). Anything
+  the fast mode can't verify escalates to full pyannote automatically.
+
 ## Running (CLI)
 
 A bare filename is looked up under `./Data`; output lands in `./Output`:
@@ -52,7 +63,7 @@ uv run python3 transcribe.py transcribe meeting.m4a
 ### Examples
 
 ```bash
-# transcription only -- no speaker labels, no HF_TOKEN needed
+# transcription only -- same output shape, every segment labeled SPEAKER_00
 uv run python3 transcribe.py transcribe meeting.m4a --no-diarize
 
 # force the full pyannote diarizer (most thorough)
@@ -70,7 +81,7 @@ uv run python3 transcribe.py transcribe /abs/path/audio.mp3 --json
 
 | flag | description |
 | ---- | ----------- |
-| `--no-diarize` | Skip speaker diarization entirely: transcript with word timestamps only, no speaker labels (and no `HF_TOKEN` needed). Ignores the speaker options below. |
+| `--no-diarize` | Skip speaker diarization entirely: transcript with word timestamps only, same md/vtt output with every segment labeled `SPEAKER_00` (and no `HF_TOKEN` needed). Ignores the speaker options below. |
 | `--diarize-mode fast\|auto\|pyannote` | Diarization strategy. `fast` (default): quick speaker detection that falls back to the full model automatically whenever it can't be trusted. `auto`: same, but falls back more eagerly. `pyannote`: always the full pipeline. |
 | `--language en` | Language code; auto-detected if omitted. |
 | `--min-speakers N`, `--max-speakers N` | Speaker-count hints for diarization. |
@@ -127,7 +138,7 @@ WebVTT (`--format vtt`):
 <v SPEAKER_00>Hello, welcome.
 ```
 
-With `--no-diarize` the speaker labels are simply omitted. The raw JSON shape
+With `--no-diarize` every segment is labeled `SPEAKER_00`. The raw JSON shape
 (one entry per segment):
 
 ```json
